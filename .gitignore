@@ -7,6 +7,8 @@ __pycache__/
 venv/
 env/
 ENV/
+node_modules/
+frontend/node_modules/
 
 # Downloads
 downloads/
@@ -17,13 +19,24 @@ downloads/
 
 # Sensível
 .env
+.env.local
 cookies.txt
+config/.env
+config/cookies/*
+!config/cookies/.gitkeep
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+.DS_Store
 
 # Logs
 *.log
+
+# Binaries locais
+bin/ffmpeg
+bin/ffprobe
+bin/ffmpeg.exe
+bin/ffprobe.exe

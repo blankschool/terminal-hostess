@@ -1,0 +1,22 @@
+[Unit]
+Description=n8n Download Bridge API
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+Environment=HOST=0.0.0.0
+Environment=PORT=8000
+EnvironmentFile=-${APP_DIR}/.env
+ExecStart=${APP_DIR}/venv/bin/uvicorn backend.main:app --host ${HOST} --port ${PORT} --workers 2
+Restart=always
+RestartSec=5
+User=${RUN_AS_USER}
+Group=${RUN_AS_GROUP}
+LimitNOFILE=65536
+StandardOutput=append:${APP_DIR}/logs/output.log
+StandardError=append:${APP_DIR}/logs/error.log
+
+[Install]
+WantedBy=multi-user.target

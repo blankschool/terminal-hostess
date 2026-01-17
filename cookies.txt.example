@@ -1,9 +1,0 @@
-# Netscape HTTP Cookie File
-# This is a generated file! Do not edit.
-# Este é um arquivo de exemplo. Exporte seus cookies usando extensões de navegador.
-
-# Formato:
-# domain	flag	path	secure	expiration	name	value
-
-.youtube.com	TRUE	/	TRUE	1735689600	CONSENT	YES+
-.youtube.com	TRUE	/	FALSE	1735689600	VISITOR_INFO1_LIVE	exemplo123
