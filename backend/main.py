@@ -30,6 +30,7 @@ import tempfile
 from starlette.background import BackgroundTask
 from openai import OpenAI
 import base64
+import mimetypes
 
 # Configuração de logging
 logging.basicConfig(
@@ -497,6 +498,47 @@ def transcribe_image_bytes(data: bytes, mime_type: str = "image/png", prompt: Op
         logger.error(f"Erro ao transcrever imagem: {exc}")
         raise HTTPException(status_code=500, detail="Falha na transcrição de imagem")
 
+
+def transcribe_instagram_carousel(url: str, prompt: Optional[str], max_items: int = 5) -> list[dict]:
+    """Baixa imagens do carrossel e transcreve cada uma."""
+    result = execute_gallery_dl(url)
+    raw_download_dir = result.get("download_dir")
+    download_dir = Path(raw_download_dir) if raw_download_dir else None
+    files = result.get("files", [])
+    if not files:
+        raise HTTPException(status_code=404, detail="Nenhuma imagem encontrada")
+
+    items = []
+    try:
+        limited = files[: max_items or len(files)]
+        for idx, info in enumerate(limited, start=1):
+            file_path = Path(info.get("path", ""))
+            if not file_path.exists():
+                continue
+            if file_path.stat().st_size > 25 * 1024 * 1024:
+                items.append({
+                    "index": idx,
+                    "file": file_path.name,
+                    "error": "Arquivo maior que 25MB, ignorado"
+                })
+                continue
+
+            mime, _ = mimetypes.guess_type(file_path.name)
+            mime = mime or "image/png"
+            text = transcribe_image_bytes(file_path.read_bytes(), mime_type=mime, prompt=prompt)
+            items.append({
+                "index": idx,
+                "file": file_path.name,
+                "text": text
+            })
+    finally:
+        if download_dir and download_dir.exists():
+            shutil.rmtree(download_dir, ignore_errors=True)
+
+    if not items:
+        raise HTTPException(status_code=404, detail="Nenhum item processado")
+    return items
+
 # Criar diretórios essenciais
 COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -554,6 +596,12 @@ class AudioDownloadRequest(BaseModel):
     url: HttpUrl
     format: Optional[Literal["mp3", "m4a", "wav"]] = "mp3"
     language: Optional[str] = None
+
+
+class InstagramTranscribeRequest(BaseModel):
+    url: HttpUrl
+    prompt: Optional[str] = None
+    max_items: Optional[int] = 5
 
 
 # Dependency para validar API Key
@@ -1339,6 +1387,23 @@ async def transcribe_image(
         "message": "Texto extraído com sucesso",
         "text": text,
         "mime": mime_type
+    }
+
+
+@app.post("/transcribe/instagram")
+async def transcribe_instagram(
+    request: InstagramTranscribeRequest,
+    api_key: str = Security(validate_api_key)
+):
+    """
+    Extrai texto das imagens de um post/carrossel do Instagram.
+    Usa gallery-dl para baixar imagens e vision da OpenAI para transcrição.
+    """
+    items = transcribe_instagram_carousel(str(request.url), request.prompt, request.max_items or 5)
+    return {
+        "success": True,
+        "message": f"{len(items)} imagem(ns) processada(s)",
+        "items": items
     }
 
 

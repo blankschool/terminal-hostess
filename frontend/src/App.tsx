@@ -108,9 +108,11 @@ export default function App() {
   const [transcript, setTranscript] = useState("");
   const [transcribeStatus, setTranscribeStatus] = useState("Pronto");
   const [imagePrompt, setImagePrompt] = useState("");
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [imageText, setImageText] = useState("");
+  const [instaUrl, setInstaUrl] = useState(() => targetUrl || "");
+  const [instaMax, setInstaMax] = useState(5);
+  const [imageTexts, setImageTexts] = useState<
+    { index: number; file?: string; text?: string; error?: string }[]
+  >([]);
   const [imageStatus, setImageStatus] = useState("Pronto");
   const { theme, toggle: toggleTheme } = useTheme();
 
@@ -129,14 +131,8 @@ export default function App() {
   useEffect(() => {
     if (targetUrl && !audioUrl) setAudioUrl(targetUrl);
     if (targetUrl && !transcribeUrl) setTranscribeUrl(targetUrl);
-  }, [targetUrl, audioUrl, transcribeUrl]);
-  useEffect(() => {
-    return () => {
-      if (imagePreview) {
-        URL.revokeObjectURL(imagePreview);
-      }
-    };
-  }, [imagePreview]);
+    if (targetUrl && !instaUrl) setInstaUrl(targetUrl);
+  }, [targetUrl, audioUrl, transcribeUrl, instaUrl]);
 
   const isGallery = tool === "gallery-dl";
 
@@ -331,20 +327,20 @@ export default function App() {
   });
 
   const imageMutation = useMutation({
-    mutationFn: async (file: File) => {
-      const form = new FormData();
-      form.append("file", file);
-      if (imagePrompt.trim()) {
-        form.append("prompt", imagePrompt.trim());
-      }
+    mutationFn: async () => {
       const res = await fetch(
-        `${baseUrl.replace(/\/$/, "")}/transcribe/image`,
+        `${baseUrl.replace(/\/$/, "")}/transcribe/instagram`,
         {
           method: "POST",
           headers: {
+            "Content-Type": "application/json",
             "X-API-Key": apiKey,
           },
-          body: form,
+          body: JSON.stringify({
+            url: instaUrl,
+            prompt: imagePrompt || undefined,
+            max_items: instaMax || undefined,
+          }),
         }
       );
       const data = await res.json().catch(() => ({}));
@@ -359,12 +355,12 @@ export default function App() {
       return data;
     },
     onSuccess: (data) => {
-      setImageText(data.text || "");
+      setImageTexts(data.items || []);
       setImageStatus("Texto extraído");
     },
     onError: (err: Error) => {
       setImageStatus(`Falha: ${err.message}`);
-      setImageText("");
+      setImageTexts([]);
     },
   });
 
@@ -405,28 +401,14 @@ export default function App() {
     transcribeMutation.mutate();
   }
 
-  function handleImageFileChange(fileList: FileList | null) {
-    if (!fileList || fileList.length === 0) {
-      setImageFile(null);
-      setImagePreview(null);
-      return;
-    }
-    const file = fileList[0];
-    if (imagePreview) {
-      URL.revokeObjectURL(imagePreview);
-    }
-    setImageFile(file);
-    setImagePreview(URL.createObjectURL(file));
-  }
-
   function handleTranscribeImage() {
-    if (!imageFile) {
-      setImageStatus("Envie uma imagem");
+    if (!instaUrl.trim()) {
+      setImageStatus("Informe a URL do post do Instagram");
       return;
     }
     setImageStatus("Processando...");
-    setImageText("");
-    imageMutation.mutate(imageFile);
+    setImageTexts([]);
+    imageMutation.mutate();
   }
 
   const toneClasses = useMemo(
@@ -830,27 +812,32 @@ export default function App() {
                   <ImageIcon size={16} />
                 </div>
                 <div>
-                  <p className="text-sm font-semibold">Transcrever imagem</p>
+                  <p className="text-sm font-semibold">Transcrever imagem (Instagram)</p>
                   <p className="text-xs text-muted-foreground">
-                    Extrai texto legível de fotos ou prints.
+                    Extrai texto de carrosséis do Instagram via gallery-dl + OpenAI Vision.
                   </p>
                 </div>
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-semibold">Imagem</label>
+                <label className="text-sm font-semibold">URL do post (carrossel)</label>
                 <input
-                  type="file"
-                  accept="image/*"
-                  onChange={(e) => handleImageFileChange(e.target.files)}
-                  className="w-full text-sm"
+                  value={instaUrl}
+                  onChange={(e) => setInstaUrl(e.target.value)}
+                  placeholder="https://www.instagram.com/p/..."
+                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  spellCheck={false}
                 />
-                {imagePreview && (
-                  <img
-                    src={imagePreview}
-                    alt="preview"
-                    className="rounded-lg border border-border max-h-32 object-contain mt-2"
-                  />
-                )}
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold">Máximo de imagens</label>
+                <input
+                  type="number"
+                  value={instaMax}
+                  min={1}
+                  max={10}
+                  onChange={(e) => setInstaMax(Number(e.target.value) || 1)}
+                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-semibold">Prompt (opcional)</label>
@@ -877,14 +864,24 @@ export default function App() {
                 <ImageIcon size={16} />
                 Transcrever imagem
               </Button>
-              <div className="rounded-lg border border-border bg-background/60 p-2 text-xs min-h-[80px] max-h-[200px] overflow-auto">
-                {imageText ? (
-                  <p className="whitespace-pre-wrap">{imageText}</p>
-                ) : (
+              <div className="rounded-lg border border-border bg-background/60 p-2 text-xs min-h-[80px] max-h-[200px] overflow-auto space-y-2">
+                {imageTexts.length === 0 && (
                   <p className="text-muted-foreground">
-                    O texto extraído será exibido aqui.
+                    Os textos extraídos aparecerão aqui.
                   </p>
                 )}
+                {imageTexts.map((item) => (
+                  <div key={item.index} className="space-y-1">
+                    <p className="font-semibold text-primary">
+                      Imagem #{item.index} {item.file ? `(${item.file})` : ""}
+                    </p>
+                    {item.error ? (
+                      <p className="text-red-500">{item.error}</p>
+                    ) : (
+                      <p className="whitespace-pre-wrap">{item.text}</p>
+                    )}
+                  </div>
+                ))}
               </div>
             </section>
           </div>
