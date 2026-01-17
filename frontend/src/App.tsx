@@ -7,6 +7,9 @@ import {
   Video,
   Images,
   RefreshCcw,
+  FileAudio,
+  FileText,
+  Image as ImageIcon,
 } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -28,6 +31,7 @@ type PreviewState =
 
 type Tool = "yt-dlp" | "gallery-dl";
 type Format = "mp4" | "webm" | "best";
+type AudioFormat = "mp3" | "m4a" | "wav";
 
 const STORAGE_KEYS = {
   base: "bridge:api-base",
@@ -92,6 +96,22 @@ export default function App() {
   const [statusTone, setStatusTone] = useState<"ok" | "warn" | "error" | "info">(
     "info"
   );
+  const [audioUrl, setAudioUrl] = useState(() => targetUrl || "");
+  const [audioFormat, setAudioFormat] = useState<AudioFormat>("mp3");
+  const [audioResult, setAudioResult] = useState<{ url: string; meta: string } | null>(
+    null
+  );
+  const [audioStatus, setAudioStatus] = useState("Pronto");
+  const [transcribeUrl, setTranscribeUrl] = useState(() => targetUrl || "");
+  const [transcribeFormat, setTranscribeFormat] = useState<AudioFormat>("mp3");
+  const [transcribeLang, setTranscribeLang] = useState("pt");
+  const [transcript, setTranscript] = useState("");
+  const [transcribeStatus, setTranscribeStatus] = useState("Pronto");
+  const [imagePrompt, setImagePrompt] = useState("");
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [imageText, setImageText] = useState("");
+  const [imageStatus, setImageStatus] = useState("Pronto");
   const { theme, toggle: toggleTheme } = useTheme();
 
   useEffect(() => {
@@ -106,6 +126,17 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.format, format);
   }, [format]);
+  useEffect(() => {
+    if (targetUrl && !audioUrl) setAudioUrl(targetUrl);
+    if (targetUrl && !transcribeUrl) setTranscribeUrl(targetUrl);
+  }, [targetUrl, audioUrl, transcribeUrl]);
+  useEffect(() => {
+    return () => {
+      if (imagePreview) {
+        URL.revokeObjectURL(imagePreview);
+      }
+    };
+  }, [imagePreview]);
 
   const isGallery = tool === "gallery-dl";
 
@@ -222,6 +253,121 @@ export default function App() {
     },
   });
 
+  const audioMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(
+        `${baseUrl.replace(/\/$/, "")}/audio/extract`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": apiKey,
+          },
+          body: JSON.stringify({
+            url: audioUrl,
+            format: audioFormat,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const errText = await readError(res);
+        throw new Error(errText);
+      }
+      const ct = res.headers.get("content-type") || "audio/mpeg";
+      const buffer = await res.arrayBuffer();
+      const blob = new Blob([buffer], { type: ct });
+      const url = URL.createObjectURL(blob);
+      const meta = `Formato: ${res.headers.get("x-format") || audioFormat} · Tamanho: ${
+        res.headers.get("x-file-size") || `${buffer.byteLength} bytes`
+      }`;
+      return { url, meta, contentType: ct };
+    },
+    onSuccess: (payload) => {
+      setAudioResult({ url: payload.url, meta: payload.meta });
+      setAudioStatus("Áudio pronto para download");
+    },
+    onError: (err: Error) => {
+      setAudioStatus(`Falha: ${err.message}`);
+      setAudioResult(null);
+    },
+  });
+
+  const transcribeMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(
+        `${baseUrl.replace(/\/$/, "")}/transcribe/video`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": apiKey,
+          },
+          body: JSON.stringify({
+            url: transcribeUrl,
+            format: transcribeFormat,
+            language: transcribeLang || undefined,
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          data?.detail ||
+          data?.message ||
+          (Array.isArray(data) && data[0]?.msg) ||
+          `Erro ${res.status}`;
+        throw new Error(msg);
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      setTranscript(data.transcript || data.text || "");
+      setTranscribeStatus("Transcrição pronta");
+    },
+    onError: (err: Error) => {
+      setTranscribeStatus(`Falha: ${err.message}`);
+      setTranscript("");
+    },
+  });
+
+  const imageMutation = useMutation({
+    mutationFn: async (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      if (imagePrompt.trim()) {
+        form.append("prompt", imagePrompt.trim());
+      }
+      const res = await fetch(
+        `${baseUrl.replace(/\/$/, "")}/transcribe/image`,
+        {
+          method: "POST",
+          headers: {
+            "X-API-Key": apiKey,
+          },
+          body: form,
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          data?.detail ||
+          data?.message ||
+          (Array.isArray(data) && data[0]?.msg) ||
+          `Erro ${res.status}`;
+        throw new Error(msg);
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      setImageText(data.text || "");
+      setImageStatus("Texto extraído");
+    },
+    onError: (err: Error) => {
+      setImageStatus(`Falha: ${err.message}`);
+      setImageText("");
+    },
+  });
+
   function handleDownload() {
     if (!targetUrl.trim()) {
       setStatus("Informe a URL", "warn");
@@ -237,6 +383,50 @@ export default function App() {
   function setStatus(message: string, tone: "ok" | "warn" | "error" | "info") {
     setStatusMsg(message);
     setStatusTone(tone);
+  }
+
+  function handleAudioExtract() {
+    if (!audioUrl.trim()) {
+      setAudioStatus("Informe a URL");
+      return;
+    }
+    setAudioStatus("Processando...");
+    setAudioResult(null);
+    audioMutation.mutate();
+  }
+
+  function handleTranscribeVideo() {
+    if (!transcribeUrl.trim()) {
+      setTranscribeStatus("Informe a URL");
+      return;
+    }
+    setTranscribeStatus("Processando...");
+    setTranscript("");
+    transcribeMutation.mutate();
+  }
+
+  function handleImageFileChange(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) {
+      setImageFile(null);
+      setImagePreview(null);
+      return;
+    }
+    const file = fileList[0];
+    if (imagePreview) {
+      URL.revokeObjectURL(imagePreview);
+    }
+    setImageFile(file);
+    setImagePreview(URL.createObjectURL(file));
+  }
+
+  function handleTranscribeImage() {
+    if (!imageFile) {
+      setImageStatus("Envie uma imagem");
+      return;
+    }
+    setImageStatus("Processando...");
+    setImageText("");
+    imageMutation.mutate(imageFile);
   }
 
   const toneClasses = useMemo(
@@ -483,6 +673,223 @@ export default function App() {
           </Card>
         </div>
       </div>
+
+      <Card className="border border-primary/40">
+        <CardHeader className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>Áudio e transcrição</CardTitle>
+            <CardDescription className="text-muted-foreground/90">
+              Extraia áudio de vídeos, transcreva vídeo/áudio e transforme imagens em texto.
+            </CardDescription>
+          </div>
+          <div className="flex gap-2 text-xs text-muted-foreground">
+            Usa a mesma base e API Key das chamadas principais.
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 md:grid-cols-3">
+            <section className="rounded-xl border border-border bg-secondary/40 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <div className="w-9 h-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
+                  <FileAudio size={16} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold">Extrair áudio de vídeo</p>
+                  <p className="text-xs text-muted-foreground">
+                    Baixa só o áudio via yt-dlp.
+                  </p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold">URL</label>
+                <input
+                  value={audioUrl}
+                  onChange={(e) => setAudioUrl(e.target.value)}
+                  placeholder="https://..."
+                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold">Formato do áudio</label>
+                <select
+                  value={audioFormat}
+                  onChange={(e) => setAudioFormat(e.target.value as AudioFormat)}
+                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="mp3">mp3</option>
+                  <option value="m4a">m4a</option>
+                  <option value="wav">wav</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                {audioMutation.isPending && (
+                  <RefreshCcw size={14} className="animate-spin" />
+                )}
+                <span>{audioStatus}</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="gap-2"
+                  onClick={handleAudioExtract}
+                  disabled={audioMutation.isPending}
+                >
+                  <FileAudio size={16} />
+                  Extrair áudio
+                </Button>
+                {audioResult && (
+                  <Button asChild variant="outline" size="sm" className="gap-2">
+                    <a href={audioResult.url} download>
+                      Download
+                    </a>
+                  </Button>
+                )}
+              </div>
+              {audioResult && (
+                <p className="text-xs text-muted-foreground">{audioResult.meta}</p>
+              )}
+            </section>
+
+            <section className="rounded-xl border border-border bg-secondary/40 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <div className="w-9 h-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
+                  <FileText size={16} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold">Transcrever vídeo</p>
+                  <p className="text-xs text-muted-foreground">
+                    Baixa o áudio e envia para Whisper.
+                  </p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold">URL</label>
+                <input
+                  value={transcribeUrl}
+                  onChange={(e) => setTranscribeUrl(e.target.value)}
+                  placeholder="https://..."
+                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold">Formato</label>
+                  <select
+                    value={transcribeFormat}
+                    onChange={(e) =>
+                      setTranscribeFormat(e.target.value as AudioFormat)
+                    }
+                    className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    <option value="mp3">mp3</option>
+                    <option value="m4a">m4a</option>
+                    <option value="wav">wav</option>
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold">Idioma (opcional)</label>
+                  <input
+                    value={transcribeLang}
+                    onChange={(e) => setTranscribeLang(e.target.value)}
+                    placeholder="pt"
+                    className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                {transcribeMutation.isPending && (
+                  <RefreshCcw size={14} className="animate-spin" />
+                )}
+                <span>{transcribeStatus}</span>
+              </div>
+              <Button
+                variant="default"
+                size="sm"
+                className="gap-2"
+                onClick={handleTranscribeVideo}
+                disabled={transcribeMutation.isPending}
+              >
+                <FileText size={16} />
+                Transcrever vídeo
+              </Button>
+              <div className="rounded-lg border border-border bg-background/60 p-2 text-xs min-h-[80px] max-h-[200px] overflow-auto">
+                {transcript ? (
+                  <p className="whitespace-pre-wrap">{transcript}</p>
+                ) : (
+                  <p className="text-muted-foreground">Transcrição aparecerá aqui.</p>
+                )}
+              </div>
+            </section>
+
+            <section className="rounded-xl border border-border bg-secondary/40 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <div className="w-9 h-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
+                  <ImageIcon size={16} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold">Transcrever imagem</p>
+                  <p className="text-xs text-muted-foreground">
+                    Extrai texto legível de fotos ou prints.
+                  </p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold">Imagem</label>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => handleImageFileChange(e.target.files)}
+                  className="w-full text-sm"
+                />
+                {imagePreview && (
+                  <img
+                    src={imagePreview}
+                    alt="preview"
+                    className="rounded-lg border border-border max-h-32 object-contain mt-2"
+                  />
+                )}
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold">Prompt (opcional)</label>
+                <input
+                  value={imagePrompt}
+                  onChange={(e) => setImagePrompt(e.target.value)}
+                  placeholder="Extraia todo o texto..."
+                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                {imageMutation.isPending && (
+                  <RefreshCcw size={14} className="animate-spin" />
+                )}
+                <span>{imageStatus}</span>
+              </div>
+              <Button
+                variant="default"
+                size="sm"
+                className="gap-2"
+                onClick={handleTranscribeImage}
+                disabled={imageMutation.isPending}
+              >
+                <ImageIcon size={16} />
+                Transcrever imagem
+              </Button>
+              <div className="rounded-lg border border-border bg-background/60 p-2 text-xs min-h-[80px] max-h-[200px] overflow-auto">
+                {imageText ? (
+                  <p className="whitespace-pre-wrap">{imageText}</p>
+                ) : (
+                  <p className="text-muted-foreground">
+                    O texto extraído será exibido aqui.
+                  </p>
+                )}
+              </div>
+            </section>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

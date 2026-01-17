@@ -1,4 +1,14 @@
-from fastapi import FastAPI, HTTPException, Security, status, Query, Response
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Security,
+    UploadFile,
+    status,
+    Query,
+    Response,
+)
 from fastapi.security import APIKeyHeader
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +28,8 @@ from urllib.parse import urlparse
 from io import BytesIO
 import tempfile
 from starlette.background import BackgroundTask
+from openai import OpenAI
+import base64
 
 # Configuração de logging
 logging.basicConfig(
@@ -39,6 +51,9 @@ load_dotenv(ROOT_DIR / ".env")
 load_dotenv(CONFIG_DIR / ".env", override=False)
 DEFAULT_API_KEY = "cI4cA4Xvml2O0TCXdxRDuhHdY1251G34gso3VdHfDIc"
 API_KEY = os.getenv("API_KEY", DEFAULT_API_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_AUDIO_MODEL = os.getenv("OPENAI_AUDIO_MODEL", "whisper-1")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
 
 # Cookies
 COOKIES_CANDIDATES = [
@@ -130,6 +145,7 @@ def _cached_cookie_args(file_path: Path) -> Optional[list[str]]:
 _yt_dlp_path_cache: Optional[str] = None
 _gallery_dl_path_cache: Optional[str] = None
 _ffmpeg_path_cache: Optional[str] = None
+_openai_client: Optional[OpenAI] = None
 
 
 def _is_executable(path: Path) -> bool:
@@ -312,6 +328,175 @@ def get_impersonate_args(url: str) -> list[str]:
 
 _impersonation_cache_by_path: dict[str, bool] = {}
 
+
+def get_openai_client() -> OpenAI:
+    """Retorna cliente OpenAI com cache."""
+    global _openai_client
+    if _openai_client:
+        return _openai_client
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY não configurada")
+    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
+
+def resolve_ffmpeg_binary() -> str:
+    """Resolve o binário do ffmpeg para chamadas diretas."""
+    location = get_ffmpeg_location()
+    if location and Path(location).is_dir():
+        name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        return str(Path(location) / name)
+    return location or "ffmpeg"
+
+
+def download_audio_from_url(url: str, audio_format: str = "mp3") -> Path:
+    """Baixa apenas o áudio usando yt-dlp e retorna o caminho do arquivo."""
+    t0 = perf_counter()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_template = str(DOWNLOADS_DIR / f"audio_{timestamp}.%(ext)s")
+
+    cmd: list[str] = [choose_yt_dlp_binary_for_url(url)]
+    cmd.extend(get_cookies_args(url))
+    cmd.extend(get_impersonate_args(url))
+    cmd.extend(get_ffmpeg_location_arg())
+    cmd.extend([
+        "-x",
+        "--audio-format",
+        audio_format,
+        "-o",
+        output_template,
+        "--no-playlist",
+        "--progress",
+        "--newline"
+    ])
+    cmd.append(url)
+
+    logger.info(f"Baixando áudio com yt-dlp: {' '.join(cmd)}")
+    try:
+        t1 = perf_counter()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=True
+        )
+        t2 = perf_counter()
+
+        downloaded_files = list(DOWNLOADS_DIR.glob(f"audio_{timestamp}.*"))
+        if not downloaded_files:
+            raise Exception("Áudio não encontrado após download")
+
+        file_path = downloaded_files[0]
+        logger.info(
+            "yt-dlp áudio timing prep=%.1fms run=%.1fms",
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+        )
+        logger.debug(result.stdout)
+        return file_path
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Download de áudio timeout (5 minutos)")
+    except subprocess.CalledProcessError as exc:
+        logger.error(f"Erro ao baixar áudio: {exc.stderr}")
+        raise HTTPException(status_code=500, detail=f"Erro no yt-dlp: {exc.stderr}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def extract_audio_from_upload(upload_path: Path, audio_format: str = "mp3") -> Path:
+    """Extrai áudio de um arquivo local usando ffmpeg."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = DOWNLOADS_DIR / f"audio_extract_{timestamp}.{audio_format}"
+    ffmpeg_bin = resolve_ffmpeg_binary()
+
+    codec_args = {
+        "mp3": ["-acodec", "libmp3lame"],
+        "m4a": ["-acodec", "aac"],
+        "wav": ["-acodec", "pcm_s16le", "-ar", "16000"],
+    }.get(audio_format, ["-acodec", "libmp3lame"])
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(upload_path),
+        "-vn",
+        *codec_args,
+        str(output_path),
+    ]
+
+    logger.info(f"Extraindo áudio via ffmpeg: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=240, check=True)
+        if not output_path.exists():
+            raise Exception("Arquivo de áudio não gerado")
+        return output_path
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Extração de áudio timeout (4 minutos)")
+    except subprocess.CalledProcessError as exc:
+        logger.error(f"Erro no ffmpeg: {exc.stderr}")
+        raise HTTPException(status_code=500, detail="Falha ao extrair áudio")
+
+
+def transcribe_audio_file(audio_path: Path, language: Optional[str] = None) -> str:
+    """Transcreve áudio com Whisper."""
+    try:
+        with audio_path.open("rb") as f:
+            result = get_openai_client().audio.transcriptions.create(
+                model=OPENAI_AUDIO_MODEL,
+                file=f,
+                language=language,
+                response_format="text"
+            )
+        if isinstance(result, str):
+            return result
+        text = getattr(result, "text", None)
+        return text or str(result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Erro ao transcrever áudio: {exc}")
+        raise HTTPException(status_code=500, detail="Falha na transcrição de áudio")
+
+
+def transcribe_image_bytes(data: bytes, mime_type: str = "image/png", prompt: Optional[str] = None) -> str:
+    """Transcreve texto de uma imagem usando modelo vision."""
+    try:
+        b64 = base64.b64encode(data).decode()
+        res = get_openai_client().chat.completions.create(
+            model=OPENAI_VISION_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Extraia todo o texto visível da imagem e retorne somente o texto."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt or "Transcreva o texto desta imagem."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{b64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0,
+            max_tokens=800
+        )
+        return res.choices[0].message.content.strip()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Erro ao transcrever imagem: {exc}")
+        raise HTTPException(status_code=500, detail="Falha na transcrição de imagem")
+
 # Criar diretórios essenciais
 COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -363,6 +548,12 @@ class DownloadResponse(BaseModel):
     tool_used: str
     format: Optional[str] = None
     direct_urls: Optional[list[str]] = None  # para respostas que trazem várias URLs
+
+
+class AudioDownloadRequest(BaseModel):
+    url: HttpUrl
+    format: Optional[Literal["mp3", "m4a", "wav"]] = "mp3"
+    language: Optional[str] = None
 
 
 # Dependency para validar API Key
@@ -1075,6 +1266,80 @@ async def download_stream(
     except Exception as e:
         logger.error(f"Erro no stream: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/audio/extract")
+async def extract_audio(
+    request: AudioDownloadRequest,
+    api_key: str = Security(validate_api_key)
+):
+    """Baixa apenas o áudio de um vídeo e retorna o arquivo."""
+    audio_path = download_audio_from_url(str(request.url), request.format or "mp3")
+    media_type = {
+        "mp3": "audio/mpeg",
+        "m4a": "audio/mp4",
+        "wav": "audio/wav"
+    }.get(audio_path.suffix.lstrip("."), "application/octet-stream")
+
+    return FileResponse(
+        path=audio_path,
+        filename=audio_path.name,
+        media_type=media_type,
+        headers={
+            "X-Format": audio_path.suffix.lstrip("."),
+            "X-File-Size": get_file_size(audio_path),
+            "X-Tool-Used": "yt-dlp"
+        },
+        background=BackgroundTask(audio_path.unlink, missing_ok=True)
+    )
+
+
+@app.post("/transcribe/video")
+async def transcribe_video(
+    request: AudioDownloadRequest,
+    api_key: str = Security(validate_api_key)
+):
+    """
+    Baixa o áudio do vídeo e envia para o Whisper.
+    Retorna o texto transcrito.
+    """
+    audio_path = download_audio_from_url(str(request.url), request.format or "mp3")
+    try:
+        transcript = transcribe_audio_file(audio_path, language=request.language)
+        return {
+            "success": True,
+            "message": "Transcrição concluída",
+            "transcript": transcript,
+            "format": audio_path.suffix.lstrip("."),
+            "file_size": get_file_size(audio_path)
+        }
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
+@app.post("/transcribe/image")
+async def transcribe_image(
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),
+    api_key: str = Security(validate_api_key)
+):
+    """Extrai texto de uma imagem usando modelo de visão."""
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Imagem vazia")
+
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Arquivo de imagem muito grande")
+
+    mime_type = file.content_type or "image/png"
+    text = transcribe_image_bytes(data, mime_type=mime_type, prompt=prompt)
+
+    return {
+        "success": True,
+        "message": "Texto extraído com sucesso",
+        "text": text,
+        "mime": mime_type
+    }
 
 
 if __name__ == "__main__":
