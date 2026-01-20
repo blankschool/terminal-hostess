@@ -1121,9 +1121,46 @@ def transcribe_image_bytes(data: bytes, mime_type: str = "image/png", prompt: Op
         raise HTTPException(status_code=500, detail="Falha na transcrição de imagem")
 
 
+def clean_instagram_filename(url: str, username: str, index: int) -> str:
+    """
+    Gera filename limpo para imagens do Instagram a partir da URL do CDN.
+    Remove query parameters e gera nome descritivo.
+    
+    Exemplos:
+        https://.../.../image.jpg?param=value -> instagram_username_01.jpg
+    """
+    try:
+        # Parse URL e remove query parameters
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path = parsed.path
+        
+        # Extrair extensão do arquivo
+        ext = '.jpg'  # Default
+        if '.' in path:
+            # Pegar a parte do path antes de qualquer query param
+            clean_path = path.split('?')[0]
+            if '.' in clean_path:
+                base_ext = clean_path.rsplit('.', 1)[-1].lower()
+                # Validar extensão
+                if base_ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+                    ext = f'.{base_ext}'
+        
+        # Gerar filename limpo: instagram_username_01.jpg
+        filename = f"instagram_{username}_{index:02d}{ext}"
+        return sanitize_filename(filename, max_length=100)
+    except Exception as e:
+        logger.warning(f"Failed to clean filename from {url}: {e}")
+        return f"instagram_image_{index:02d}.jpg"
+
+
 def transcribe_instagram_carousel(url: str, prompt: Optional[str]) -> list[dict]:
     """Baixa imagens do carrossel e transcreve cada uma em paralelo para maior velocidade."""
     t0 = perf_counter()
+    
+    # Extract username from URL for clean filenames
+    username = extract_username_from_instagram_url(url)
+    logger.info(f"📸 Extracting carousel from @{username}")
     
     # First, get direct URLs (for frontend display)
     direct_urls = execute_gallery_dl_urls(url)
@@ -1172,11 +1209,15 @@ def transcribe_instagram_carousel(url: str, prompt: Optional[str]) -> list[dict]
                 idx, file_path, direct_url, mime, task_type = task_data
                 t_start = perf_counter()
 
+                # Generate clean filename for download
+                clean_filename = clean_instagram_filename(direct_url, username, idx)
+                
                 if task_type == "video":
                     result = {
                         "index": idx,
                         "file": file_path.name,
                         "url": direct_url,
+                        "filename": clean_filename,  # Clean filename for download
                         "is_video": True,
                         "text": ""
                     }
@@ -1190,14 +1231,17 @@ def transcribe_instagram_carousel(url: str, prompt: Optional[str]) -> list[dict]
                         "index": idx,
                         "file": file_path.name,
                         "url": direct_url,
+                        "filename": clean_filename,  # Clean filename for download
                         "is_video": False,
                         "text": text
                     }
                 else:
+                    clean_filename = clean_instagram_filename(direct_url, username, idx)
                     return {
                         "index": idx,
                         "file": file_path.name,
                         "url": direct_url,
+                        "filename": clean_filename,  # Clean filename for download
                         "error": task_type
                     }
 

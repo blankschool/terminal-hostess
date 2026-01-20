@@ -238,11 +238,12 @@ export default function App() {
       throw new Error('Resposta inválida da API');
     }
 
-    // Backend now includes URLs in the transcription response
+    // Backend now includes URLs and clean filenames in the transcription response
     const images = data.items
       .filter((item: any) => !item.is_video && item.url)
       .map((item: any) => {
-        const filename = item.url?.split('/').pop() || item.file || `image_${item.index}.jpg`;
+        // Use clean filename from backend (e.g., instagram_username_01.jpg)
+        const filename = item.filename || item.file || `instagram_image_${item.index}.jpg`;
         return {
           url: item.url,
           transcription: item.text || '',
