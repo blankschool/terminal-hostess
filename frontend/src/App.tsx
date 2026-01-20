@@ -1,892 +1,754 @@
-import { useEffect, useMemo, useState } from "react";
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Download, Image, Mic, Settings, Info, Moon, Sun } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { SettingsPanel, AppSettings } from './components/SettingsPanel';
+import { Footer } from './components/Footer';
+import { VideoResult } from './components/VideoResult';
+import { ImageCarouselResult } from './components/ImageCarouselResult';
+import { AudioResult } from './components/AudioResult';
+import { apiFetch } from './lib/api';
 import {
-  Download,
-  Link as LinkIcon,
-  Moon,
-  Sun,
-  Video,
-  Images,
-  RefreshCcw,
-  FileAudio,
-  FileText,
-  Image as ImageIcon,
-} from "lucide-react";
-import { useMutation } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { cn } from "@/lib/utils";
+  detectPlatform,
+  isCarouselUrl,
+  triggerBrowserDownload,
+  generateFilename,
+  getFilenameFromResponse,
+  formatErrorMessage,
+  downloadFromUrl,
+} from './lib/download';
 
-type PreviewState =
-  | { kind: "none" }
-  | { kind: "image"; url: string }
-  | { kind: "video"; url: string }
-  | { kind: "gallery"; urls: string[] };
-
-type Tool = "yt-dlp" | "gallery-dl";
-type Format = "mp4" | "webm" | "best";
-type AudioFormat = "mp3" | "m4a" | "wav";
-
-const STORAGE_KEYS = {
-  base: "bridge:api-base",
-  apiKey: "bridge:api-key",
-  url: "bridge:last-url",
-  tool: "bridge:last-tool",
-  format: "bridge:last-format",
-  theme: "bridge:theme",
-};
-
-const DEFAULT_API_KEY = import.meta.env.VITE_API_KEY || "";
-
-async function readError(response: Response) {
-  const ct = response.headers.get("content-type") || "";
-  try {
-    if (ct.includes("application/json")) {
-      const data = await response.json();
-      return data.detail || JSON.stringify(data);
-    }
-    return await response.text();
-  } catch {
-    return `Erro ${response.status}`;
-  }
+interface VideoResultData {
+  type: 'video';
+  filename: string;
+  platform: string;
+  blob: Blob;
+  fileSize: string;
 }
 
-function useTheme() {
-  const [theme, setTheme] = useState<string>(() => {
-    return localStorage.getItem(STORAGE_KEYS.theme) || "dark";
-  });
-
-  useEffect(() => {
-    const root = document.documentElement;
-    const isLight = theme === "light";
-    root.classList.toggle("theme-light", isLight);
-    localStorage.setItem(STORAGE_KEYS.theme, theme);
-  }, [theme]);
-
-  const toggle = () => setTheme((prev) => (prev === "light" ? "dark" : "light"));
-  return { theme, toggle };
+interface ImageCarouselResultData {
+  type: 'carousel';
+  images: Array<{
+    url: string;
+    transcription: string;
+    filename: string;
+  }>;
 }
+
+interface AudioResultData {
+  type: 'audio';
+  transcription: string;
+}
+
+type ResultData = VideoResultData | ImageCarouselResultData | AudioResultData;
 
 export default function App() {
-  const [baseUrl, setBaseUrl] = useState(() => {
-    return localStorage.getItem(STORAGE_KEYS.base) || window.location.origin;
+  const [url, setUrl] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+  const [downloadType, setDownloadType] = useState<'video' | 'images' | 'audio'>('video');
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [isLoading, setIsLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [result, setResult] = useState<ResultData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [settings, setSettings] = useState<AppSettings>({
+    videoQuality: 'max',
+    audioFormat: 'mp3',
+    transcriptionLanguage: 'auto',
   });
-  const [apiKey] = useState(() => DEFAULT_API_KEY);
-  const [targetUrl, setTargetUrl] = useState(() => {
-    return localStorage.getItem(STORAGE_KEYS.url) || "";
-  });
-  const [tool, setTool] = useState<Tool>(() => {
-    return (localStorage.getItem(STORAGE_KEYS.tool) as Tool) || "yt-dlp";
-  });
-  const [format, setFormat] = useState<Format>(() => {
-    return (localStorage.getItem(STORAGE_KEYS.format) as Format) || "mp4";
-  });
-  const [quality, setQuality] = useState("best");
-  const [preview, setPreview] = useState<PreviewState>({ kind: "none" });
-  const [jsonResult, setJsonResult] = useState<any>({ status: "aguardando" });
-  const [meta, setMeta] = useState<string[]>(["Sem chamadas ainda."]);
-  const [galleryLinks, setGalleryLinks] = useState<string[]>([]);
-  const [statusMsg, setStatusMsg] = useState<string>("Pronto");
-  const [statusTone, setStatusTone] = useState<"ok" | "warn" | "error" | "info">(
-    "info"
-  );
-  const [audioUrl, setAudioUrl] = useState(() => targetUrl || "");
-  const [audioFormat, setAudioFormat] = useState<AudioFormat>("mp3");
-  const [audioResult, setAudioResult] = useState<{ url: string; meta: string } | null>(
-    null
-  );
-  const [audioStatus, setAudioStatus] = useState("Pronto");
-  const [transcribeUrl, setTranscribeUrl] = useState(() => targetUrl || "");
-  const [transcribeFormat, setTranscribeFormat] = useState<AudioFormat>("mp3");
-  const [transcribeLang, setTranscribeLang] = useState("pt");
-  const [transcript, setTranscript] = useState("");
-  const [transcribeStatus, setTranscribeStatus] = useState("Pronto");
-  const [imagePrompt, setImagePrompt] = useState("");
-  const [instaUrl, setInstaUrl] = useState(() => targetUrl || "");
-  const [instaMax, setInstaMax] = useState(5);
-  const [imageTexts, setImageTexts] = useState<
-    { index: number; file?: string; text?: string; error?: string }[]
-  >([]);
-  const [imageStatus, setImageStatus] = useState("Pronto");
-  const { theme, toggle: toggleTheme } = useTheme();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const handleDownloadRef = useRef<() => Promise<void>>();
+  const progressIntervalRef = useRef<number | null>(null);
 
+  // Load settings from localStorage on mount
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.base, baseUrl);
-  }, [baseUrl]);
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.url, targetUrl);
-  }, [targetUrl]);
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.tool, tool);
-  }, [tool]);
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.format, format);
-  }, [format]);
-  useEffect(() => {
-    if (targetUrl && !audioUrl) setAudioUrl(targetUrl);
-    if (targetUrl && !transcribeUrl) setTranscribeUrl(targetUrl);
-    if (targetUrl && !instaUrl) setInstaUrl(targetUrl);
-  }, [targetUrl, audioUrl, transcribeUrl, instaUrl]);
+    const savedSettings = localStorage.getItem('app_settings');
+    if (savedSettings) {
+      try {
+        const parsed = JSON.parse(savedSettings);
+        setSettings({ ...settings, ...parsed });
+      } catch (err) {
+        console.error('Failed to load settings:', err);
+      }
+    }
+  }, []);
 
-  const isGallery = tool === "gallery-dl";
+  const toggleTheme = () => {
+    setTheme(theme === 'dark' ? 'light' : 'dark');
+  };
 
-  const downloadMutation = useMutation({
-    mutationFn: async () => {
-      const params = new URLSearchParams({
-        url: targetUrl,
-        tool,
-        format,
+  const isDark = theme === 'dark';
+
+  // Auto-focus input on mount
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  // Auto-download when video result is ready
+  useEffect(() => {
+    if (result && result.type === 'video') {
+      // Automatically trigger download
+      triggerBrowserDownload(result.blob, result.filename);
+    }
+  }, [result]);
+
+  // Format file size helper
+  const formatFileSize = (bytes: number): string => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  };
+
+  // Handle Enter key press
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && url && !isLoading) {
+      handleDownload();
+    }
+  };
+
+  const handleDownloadVideo = async (url: string) => {
+    const platform = detectPlatform(url);
+    
+    // Always use max quality
+    const endpoint = `/download/binary?url=${encodeURIComponent(url)}&format=mp4&quality=max`;
+
+    try {
+      // No timeout for large file downloads (YouTube can be 300MB+)
+      const response = await apiFetch(endpoint, {
+        method: 'POST',
       });
-      const res = await fetch(
-        `${baseUrl.replace(/\/$/, "")}/download/binary?${params.toString()}`,
-        {
-          method: "POST",
-          headers: {
-            "X-API-Key": apiKey,
-          },
-        }
-      );
-      if (!res.ok) {
-        const errText = await readError(res);
-        throw new Error(errText);
-      }
-      const ct = res.headers.get("content-type") || "application/octet-stream";
-      const buffer = await res.arrayBuffer();
-      const blob = new Blob([buffer], { type: ct });
-      const fileUrl = URL.createObjectURL(blob);
-      const fileSize = res.headers.get("x-file-size");
-      const toolUsed = res.headers.get("x-tool-used") || tool;
-      const formatUsed = res.headers.get("x-format") || format;
 
-      return {
-        blob,
-        url: fileUrl,
-        contentType: ct,
-        meta: { fileSize, toolUsed, formatUsed, sizeBytes: buffer.byteLength },
-      };
-    },
-    onSuccess: (payload) => {
-      const isImage = payload.contentType.startsWith("image/");
-      const isVideo = payload.contentType.startsWith("video/");
-      setPreview(
-        isImage
-          ? { kind: "image", url: payload.url }
-          : { kind: "video", url: payload.url }
-      );
-      setStatus("Arquivo pronto", "ok");
-      setGalleryLinks([]);
-      setJsonResult({
-        success: true,
-        message: "Arquivo pronto",
-        headers: payload.meta,
+      if (!response.ok) {
+        // Try to parse JSON error from backend
+        try {
+          const errorJson = await response.json();
+          const errorDetail = errorJson.detail || JSON.stringify(errorJson);
+          throw new Error(errorDetail);
+        } catch (parseErr) {
+          // If not JSON, use text
+          const errorText = await response.text();
+          throw new Error(errorText || 'Erro ao baixar vídeo');
+        }
+      }
+
+      // Check if response contains a direct download URL (Instagram/TikTok)
+      const directDownloadHeader = response.headers.get('X-Direct-Download');
+      if (directDownloadHeader === 'true') {
+        const jsonData = await response.json();
+        const directUrl = jsonData.direct_url;
+        const platform = response.headers.get('X-Platform') || '';
+        const filename = jsonData.filename || '';
+        
+        // TikTok: Auto-download via fetch + blob (avoids CORS issues with download attribute)
+        if (platform === 'tiktok') {
+          try {
+            // Fetch the video from CDN
+            const videoResponse = await fetch(directUrl);
+            if (!videoResponse.ok) {
+              throw new Error('Failed to download video from TikTok CDN');
+            }
+            
+            // Convert to blob
+            const blob = await videoResponse.blob();
+            
+            // Trigger download using blob URL
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = filename || 'tiktok_video.mp4';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            
+            // Clean up blob URL
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 100);
+            
+            return null; // Flow ends - download completed
+          } catch (error) {
+            console.error('TikTok download error:', error);
+            // Fallback: open in new tab if fetch fails
+            window.open(directUrl, '_blank');
+            return null;
+          }
+        }
+        
+        // Instagram: Open in new tab (keeps current behavior)
+        if (platform === 'instagram') {
+          window.open(directUrl, '_blank');
+          return null;
+        }
+        
+        // Fallback for other platforms
+        window.open(directUrl, '_blank');
+        return null;
+      }
+
+      // Handle normal blob responses (YouTube/Twitter - server-side download)
+      // Get Content-Length to show progress
+      const contentLength = response.headers.get('Content-Length');
+      const totalBytes = contentLength ? parseInt(contentLength, 10) : 0;
+      
+      if (totalBytes > 0) {
+        console.log(`Receiving ${formatFileSize(totalBytes)} from server...`);
+      }
+      
+      const blob = await response.blob();
+      
+      // Validate blob is not empty
+      if (blob.size === 0) {
+        throw new Error('Download falhou: arquivo vazio. Tente novamente.');
+      }
+      
+      const filename = getFilenameFromResponse(response, `${platform}_${Date.now()}.mp4`);
+      const fileSize = formatFileSize(blob.size);
+
+      return { blob, filename, platform, fileSize };
+    } catch (err: any) {
+      // Handle timeout errors
+      if (err.name === 'AbortError') {
+        throw new Error('Download expirou. O arquivo pode ser muito grande. Tente novamente.');
+      }
+      
+      // Show generic error for TikTok fetch errors
+      const platform = detectPlatform(url);
+      if (platform === 'tiktok' && (err instanceof TypeError || err.message.includes('fetch'))) {
+        throw new Error('Não foi possível baixar. Tente novamente.');
+      }
+      throw err;
+    }
+  };
+
+  const handleDownloadCarousel = async (url: string) => {
+    const response = await apiFetch('/transcribe/instagram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || 'Erro ao processar carrossel');
+    }
+
+    const data = await response.json();
+    
+    if (!data.items || !Array.isArray(data.items)) {
+      throw new Error('Resposta inválida da API');
+    }
+
+    // Backend now includes URLs in the transcription response
+    const images = data.items
+      .filter((item: any) => !item.is_video && item.url)
+      .map((item: any) => {
+        const filename = item.url?.split('/').pop() || item.file || `image_${item.index}.jpg`;
+        return {
+          url: item.url,
+          transcription: item.text || '',
+          filename,
+        };
       });
-      setMeta([
-        `Ferramenta: ${payload.meta.toolUsed}`,
-        `Formato: ${payload.meta.formatUsed}`,
-        `Tamanho: ${payload.meta.fileSize || `${payload.meta.sizeBytes} bytes`}`,
-      ]);
-    },
-    onError: (err: Error) => {
-      setPreview({ kind: "none" });
-      setStatus(`Falha: ${err.message}`, "error");
-      setJsonResult({ error: err.message });
-      setGalleryLinks([]);
-    },
-  });
 
-  const galleryMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(
-        `${baseUrl.replace(/\/$/, "")}/download/gallery/urls`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-Key": apiKey,
-          },
-          body: JSON.stringify({
-            url: targetUrl,
-            tool,
-            format,
-            quality,
-          }),
+    return images;
+  };
+
+  const handleTranscribeAudio = async (url: string) => {
+    const language = settings.transcriptionLanguage === 'auto' ? undefined : settings.transcriptionLanguage;
+    const response = await apiFetch('/transcribe/video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        url, 
+        format: settings.audioFormat,
+        language: language
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || 'Erro ao transcrever áudio');
+    }
+
+    const data = await response.json();
+    return data.transcript || 'Transcrição não disponível';
+  };
+
+  const handleSettingsChange = (newSettings: AppSettings) => {
+    setSettings(newSettings);
+  };
+
+  // Simulate progress based on platform estimated times
+  const startProgressSimulation = (platform: string, type: 'video' | 'images' | 'audio') => {
+    // Clear any existing progress interval
+    if (progressIntervalRef.current) {
+      clearInterval(progressIntervalRef.current);
+    }
+    
+    setProgress(0);
+    
+    // Estimated completion times (in seconds) per platform
+    const estimatedTimes: Record<string, number> = {
+      'youtube': type === 'audio' ? 20 : 120, // YouTube can be large (up to 2 minutes)
+      'tiktok': 4,
+      'instagram': type === 'images' ? 8 : 5,
+      'twitter': 8,
+      'unknown': 10,
+    };
+    
+    const totalTime = estimatedTimes[platform] || estimatedTimes['unknown'];
+    const updateInterval = 100; // Update every 100ms
+    const totalSteps = (totalTime * 1000) / updateInterval;
+    let currentStep = 0;
+    
+    progressIntervalRef.current = window.setInterval(() => {
+      currentStep++;
+      // Progress slows down as it approaches 95% (never reaches 100% until complete)
+      const rawProgress = (currentStep / totalSteps) * 100;
+      const easedProgress = 95 * (1 - Math.exp(-rawProgress / 30));
+      setProgress(Math.min(easedProgress, 95));
+    }, updateInterval);
+  };
+  
+  const stopProgressSimulation = () => {
+    if (progressIntervalRef.current) {
+      clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
+    }
+    setProgress(100);
+    // Reset progress after animation completes
+    setTimeout(() => setProgress(0), 500);
+  };
+
+  const handleDownload = async () => {
+    if (!url) return;
+
+    const platform = detectPlatform(url);
+    setIsLoading(true);
+    setError(null);
+    setResult(null);
+    
+    startProgressSimulation(platform, downloadType);
+
+    try {
+      if (downloadType === 'video') {
+        const videoResult = await handleDownloadVideo(url);
+        
+        // If videoResult is null, it means browser was redirected to direct URL
+        // No need to show result UI, download happens automatically
+        if (videoResult === null) {
+          return; // Exit early - browser is handling the download
         }
-      );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const msg =
-          data?.detail ||
-          (Array.isArray(data) && data[0]?.msg) ||
-          JSON.stringify(data) ||
-          `Erro ${res.status}`;
-        throw new Error(msg);
-      }
-      return data;
-    },
-    onSuccess: (data) => {
-      const urls: string[] = data.direct_urls || [];
-      setGalleryLinks(urls);
-      setPreview(urls.length ? { kind: "gallery", urls } : { kind: "none" });
-      setStatus(`Links obtidos (${urls.length})`, "ok");
-      setJsonResult(data);
-      setMeta([
-        `Ferramenta: ${tool}`,
-        `Total de links: ${urls.length}`,
-        `URL base: ${targetUrl}`,
-      ]);
-    },
-    onError: (err: Error) => {
-      setStatus(`Falha: ${err.message}`, "error");
-      setJsonResult({ error: err.message });
-      setGalleryLinks([]);
-      setPreview({ kind: "none" });
-    },
-  });
-
-  const audioMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(
-        `${baseUrl.replace(/\/$/, "")}/audio/extract`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-Key": apiKey,
-          },
-          body: JSON.stringify({
-            url: audioUrl,
-            format: audioFormat,
-          }),
+        
+        if (!videoResult || !videoResult.blob || !videoResult.filename) {
+          throw new Error('Erro ao obter dados do vídeo');
         }
-      );
-      if (!res.ok) {
-        const errText = await readError(res);
-        throw new Error(errText);
-      }
-      const ct = res.headers.get("content-type") || "audio/mpeg";
-      const buffer = await res.arrayBuffer();
-      const blob = new Blob([buffer], { type: ct });
-      const url = URL.createObjectURL(blob);
-      const meta = `Formato: ${res.headers.get("x-format") || audioFormat} · Tamanho: ${
-        res.headers.get("x-file-size") || `${buffer.byteLength} bytes`
-      }`;
-      return { url, meta, contentType: ct };
-    },
-    onSuccess: (payload) => {
-      setAudioResult({ url: payload.url, meta: payload.meta });
-      setAudioStatus("Áudio pronto para download");
-    },
-    onError: (err: Error) => {
-      setAudioStatus(`Falha: ${err.message}`);
-      setAudioResult(null);
-    },
-  });
-
-  const transcribeMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(
-        `${baseUrl.replace(/\/$/, "")}/transcribe/video`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-Key": apiKey,
-          },
-          body: JSON.stringify({
-            url: transcribeUrl,
-            format: transcribeFormat,
-            language: transcribeLang || undefined,
-          }),
+        setResult({
+          type: 'video',
+          filename: videoResult.filename,
+          platform: videoResult.platform,
+          blob: videoResult.blob,
+          fileSize: videoResult.fileSize,
+        });
+      } else if (downloadType === 'images') {
+        // Check if it's an Instagram post/carousel
+        if (!isCarouselUrl(url)) {
+          throw new Error('Esta URL não é um post do Instagram. Use a opção "Vídeo" para reels ou stories.');
         }
-      );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const msg =
-          data?.detail ||
-          data?.message ||
-          (Array.isArray(data) && data[0]?.msg) ||
-          `Erro ${res.status}`;
-        throw new Error(msg);
-      }
-      return data;
-    },
-    onSuccess: (data) => {
-      setTranscript(data.transcript || data.text || "");
-      setTranscribeStatus("Transcrição pronta");
-    },
-    onError: (err: Error) => {
-      setTranscribeStatus(`Falha: ${err.message}`);
-      setTranscript("");
-    },
-  });
 
-  const imageMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(
-        `${baseUrl.replace(/\/$/, "")}/transcribe/instagram`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-Key": apiKey,
-          },
-          body: JSON.stringify({
-            url: instaUrl,
-            prompt: imagePrompt || undefined,
-            max_items: instaMax || undefined,
-          }),
+        const images = await handleDownloadCarousel(url);
+        
+        if (images.length === 0) {
+          throw new Error('Nenhuma imagem encontrada no carrossel');
         }
-      );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const msg =
-          data?.detail ||
-          data?.message ||
-          (Array.isArray(data) && data[0]?.msg) ||
-          `Erro ${res.status}`;
-        throw new Error(msg);
+
+        setResult({
+          type: 'carousel',
+          images,
+        });
+      } else if (downloadType === 'audio') {
+        const transcription = await handleTranscribeAudio(url);
+        setResult({
+          type: 'audio',
+          transcription,
+        });
       }
-      return data;
-    },
-    onSuccess: (data) => {
-      setImageTexts(data.items || []);
-      setImageStatus("Texto extraído");
-    },
-    onError: (err: Error) => {
-      setImageStatus(`Falha: ${err.message}`);
-      setImageTexts([]);
-    },
-  });
-
-  function handleDownload() {
-    if (!targetUrl.trim()) {
-      setStatus("Informe a URL", "warn");
-      return;
+    } catch (err) {
+      const errorMessage = formatErrorMessage(err);
+      setError(errorMessage);
+      console.error('Download error:', err);
+    } finally {
+      stopProgressSimulation();
+      setIsLoading(false);
     }
-    if (isGallery) {
-      galleryMutation.mutate();
-    } else {
-      downloadMutation.mutate();
+  };
+
+  // Keep handleDownload ref updated
+  useEffect(() => {
+    handleDownloadRef.current = handleDownload;
+  }, [handleDownload]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Cmd/Ctrl + V: Focus input and paste from clipboard
+      if ((e.metaKey || e.ctrlKey) && e.key === 'v' && !e.shiftKey && !isLoading) {
+        e.preventDefault();
+        inputRef.current?.focus();
+        navigator.clipboard.readText().then(text => {
+          if (text && (text.includes('instagram.com') || text.includes('youtube.com') || 
+              text.includes('tiktok.com') || text.includes('twitter.com') || text.includes('x.com') ||
+              text.includes('youtu.be'))) {
+            setUrl(text);
+          }
+        }).catch(err => {
+          console.error('Failed to read clipboard:', err);
+        });
+      }
+      
+      // Cmd/Ctrl + Shift + V: Paste and download immediately
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'V' && !isLoading) {
+        e.preventDefault();
+        navigator.clipboard.readText().then(text => {
+          if (text && (text.includes('instagram.com') || text.includes('youtube.com') || 
+              text.includes('tiktok.com') || text.includes('twitter.com') || text.includes('x.com') ||
+              text.includes('youtu.be'))) {
+            setUrl(text);
+            // Small delay to ensure state updates before download
+            setTimeout(() => {
+              if (!isLoading && text && handleDownloadRef.current) {
+                handleDownloadRef.current();
+              }
+            }, 100);
+          }
+        }).catch(err => {
+          console.error('Failed to read clipboard:', err);
+        });
+      }
+      
+      // Escape: Clear everything
+      if (e.key === 'Escape') {
+        setUrl('');
+        setResult(null);
+        setError(null);
+        inputRef.current?.focus();
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isLoading]);
+
+  const handleVideoDownload = () => {
+    if (result && result.type === 'video') {
+      triggerBrowserDownload(result.blob, result.filename);
     }
-  }
+  };
 
-  function setStatus(message: string, tone: "ok" | "warn" | "error" | "info") {
-    setStatusMsg(message);
-    setStatusTone(tone);
-  }
-
-  function handleAudioExtract() {
-    if (!audioUrl.trim()) {
-      setAudioStatus("Informe a URL");
-      return;
+  const handleImageDownload = async (imageUrl: string, filename: string) => {
+    try {
+      await downloadFromUrl(imageUrl, filename);
+    } catch (err) {
+      setError(formatErrorMessage(err));
     }
-    setAudioStatus("Processando...");
-    setAudioResult(null);
-    audioMutation.mutate();
-  }
+  };
 
-  function handleTranscribeVideo() {
-    if (!transcribeUrl.trim()) {
-      setTranscribeStatus("Informe a URL");
-      return;
+  const handleDownloadAllImages = async () => {
+    if (result && result.type === 'carousel') {
+      for (const image of result.images) {
+        try {
+          await downloadFromUrl(image.url, image.filename);
+          // Add a small delay between downloads to avoid overwhelming the browser
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (err) {
+          console.error('Error downloading image:', err);
+        }
+      }
     }
-    setTranscribeStatus("Processando...");
-    setTranscript("");
-    transcribeMutation.mutate();
-  }
-
-  function handleTranscribeImage() {
-    if (!instaUrl.trim()) {
-      setImageStatus("Informe a URL do post do Instagram");
-      return;
-    }
-    setImageStatus("Processando...");
-    setImageTexts([]);
-    imageMutation.mutate();
-  }
-
-  const toneClasses = useMemo(
-    () =>
-      ({
-        ok: "bg-primary/20 text-primary",
-        warn: "bg-amber-200/40 text-amber-900 dark:text-amber-200",
-        error: "bg-red-200/40 text-red-900 dark:text-red-100",
-        info: "bg-secondary/60 text-muted-foreground",
-      } as const),
-    []
-  );
-
-  const isLoading = downloadMutation.isPending || galleryMutation.isPending;
+  };
 
   return (
-    <div className="container py-6 flex flex-col gap-4">
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
-            savedown
-          </p>
-          <h1 className="text-2xl font-bold leading-tight">Download em um passo</h1>
-          <p className="text-sm text-muted-foreground max-w-3xl">
-            Cole a URL, escolha vídeo ou galeria e clique em baixar.
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={toggleTheme}
-            className="gap-2"
-            title="Alternar tema"
-          >
-            {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
-            {theme === "light" ? "Tema escuro" : "Tema claro"}
-          </Button>
+    <div className={`min-h-screen ${isDark ? 'bg-[#0f0f0f] text-white' : 'bg-white text-[#1a1a1a]'} flex flex-col transition-colors duration-300`}>
+      {/* Header */}
+      <header className={`border-b ${isDark ? 'border-[#2a2a2a]' : 'border-[#e0e0e0]'} py-6`}>
+        <div className="max-w-3xl mx-auto px-4">
+          <div className="flex items-center justify-end">
+            <div className="flex items-center gap-2">
+              <motion.button
+                onClick={toggleTheme}
+                className={`p-2 ${isDark ? 'hover:bg-[#1a1a1a]' : 'hover:bg-[#e8e8e8]'} rounded-lg transition-colors`}
+                aria-label="Alternar tema"
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+              >
+                <AnimatePresence mode="wait">
+                  {isDark ? (
+                    <motion.div
+                      key="sun"
+                      initial={{ rotate: -90, opacity: 0 }}
+                      animate={{ rotate: 0, opacity: 1 }}
+                      exit={{ rotate: 90, opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                    >
+                      <Sun className="w-5 h-5" />
+                    </motion.div>
+                  ) : (
+                    <motion.div
+                      key="moon"
+                      initial={{ rotate: 90, opacity: 0 }}
+                      animate={{ rotate: 0, opacity: 1 }}
+                      exit={{ rotate: -90, opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                    >
+                      <Moon className="w-5 h-5" />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.button>
+              <motion.button
+                onClick={() => setShowSettings(!showSettings)}
+                className={`p-2 ${isDark ? 'hover:bg-[#1a1a1a]' : 'hover:bg-[#e8e8e8]'} rounded-lg transition-colors`}
+                aria-label="Configurações"
+                whileHover={{ scale: 1.05, rotate: 90 }}
+                whileTap={{ scale: 0.95 }}
+              >
+                <Settings className="w-5 h-5" />
+              </motion.button>
+            </div>
+          </div>
         </div>
       </header>
 
-      <div className="grid gap-4 lg:grid-cols-[360px_1fr]">
-        <Card className="card-muted">
-          <CardHeader>
-            <CardTitle>Chamada</CardTitle>
-            <CardDescription className="text-muted-foreground/80">
-              Informe link, ferramenta e formato.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <label className="text-sm font-semibold flex items-center gap-2">
-                URL do conteúdo
-              </label>
-              <div className="flex gap-2">
-                <span className="inline-flex items-center justify-center w-9 h-9 rounded-lg bg-secondary/60 text-muted-foreground border border-border">
-                  <LinkIcon size={16} />
-                </span>
-                <input
-                  value={targetUrl}
-                  onChange={(e) => setTargetUrl(e.target.value)}
-                  placeholder="https://..."
-                  className="w-full rounded-lg border border-border bg-secondary/40 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  spellCheck={false}
-                />
-              </div>
-            </div>
+      {/* Main Content */}
+      <main className="flex-1 flex items-center justify-center px-4 py-12">
+        <div className="max-w-3xl w-full space-y-8">
+          {/* Intro Text */}
+          <motion.div 
+            className="text-center space-y-3"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.1 }}
+          >
+            <h2 className="text-4xl font-bold">Baixar e Transcrever</h2>
+            <p className={`${isDark ? 'text-[#a0a0a0]' : 'text-[#666666]'} text-lg`}>
+              Salve vídeos, imagens e transcreva áudios do Instagram, YouTube, TikTok e X
+            </p>
+          </motion.div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">Ferramenta</label>
-                <select
-                  value={tool}
-                  onChange={(e) => setTool(e.target.value as Tool)}
-                  className="w-full rounded-lg border border-border bg-secondary/40 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                >
-                  <option value="yt-dlp">yt-dlp (vídeo)</option>
-                  <option value="gallery-dl">gallery-dl (galeria)</option>
-                </select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">Formato</label>
-                <select
-                  value={isGallery ? "best" : format}
-                  onChange={(e) => setFormat(e.target.value as Format)}
-                  disabled={isGallery}
-                  className="w-full rounded-lg border border-border bg-secondary/40 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
-                >
-                  <option value="mp4">mp4</option>
-                  <option value="webm">webm</option>
-                  <option value="best">best</option>
-                </select>
-              </div>
-            </div>
+          {/* Download Type Selector */}
+          <motion.div 
+            className="flex gap-3 justify-center"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.2 }}
+          >
+            <motion.button
+              onClick={() => setDownloadType('video')}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                downloadType === 'video'
+                  ? isDark ? 'bg-[#4a4a4a] text-white' : 'bg-[#1a1a1a] text-white'
+                  : isDark ? 'bg-[#1a1a1a] text-[#a0a0a0] hover:bg-[#252525]' : 'bg-[#e8e8e8] text-[#666666] hover:bg-[#d8d8d8]'
+              }`}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+            >
+              <Download className="w-4 h-4" />
+              Vídeo
+            </motion.button>
+            <motion.button
+              onClick={() => setDownloadType('images')}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                downloadType === 'images'
+                  ? isDark ? 'bg-[#4a4a4a] text-white' : 'bg-[#1a1a1a] text-white'
+                  : isDark ? 'bg-[#1a1a1a] text-[#a0a0a0] hover:bg-[#252525]' : 'bg-[#e8e8e8] text-[#666666] hover:bg-[#d8d8d8]'
+              }`}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+            >
+              <Image className="w-4 h-4" />
+              Imagens
+            </motion.button>
+            <motion.button
+              onClick={() => setDownloadType('audio')}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                downloadType === 'audio'
+                  ? isDark ? 'bg-[#4a4a4a] text-white' : 'bg-[#1a1a1a] text-white'
+                  : isDark ? 'bg-[#1a1a1a] text-[#a0a0a0] hover:bg-[#252525]' : 'bg-[#e8e8e8] text-[#666666] hover:bg-[#d8d8d8]'
+              }`}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+            >
+              <Mic className="w-4 h-4" />
+              Áudio
+            </motion.button>
+          </motion.div>
 
-            <div className="space-y-2">
-              <label className="text-sm font-semibold">Qualidade</label>
-              <input
-                value={quality}
-                onChange={(e) => setQuality(e.target.value)}
-                placeholder="best"
-                className="w-full rounded-lg border border-border bg-secondary/40 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="default"
-                className="gap-2"
-                onClick={handleDownload}
+          {/* URL Input and Download Button */}
+          <motion.div 
+            className="space-y-4"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.3 }}
+          >
+            <div className="relative space-y-2">
+              <motion.input
+                ref={inputRef}
+                type="text"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder="Cole o link do Instagram, YouTube, TikTok ou X..."
+                className={`w-full px-6 py-4 ${
+                  isDark ? 'bg-[#1a1a1a] border-[#2a2a2a] text-white placeholder-[#6a6a6a] focus:border-[#4a4a4a]' : 'bg-white border-[#d0d0d0] text-[#1a1a1a] placeholder-[#999999] focus:border-[#999999]'
+                } border rounded-xl focus:outline-none transition-colors`}
+                whileFocus={{ scale: 1.01 }}
                 disabled={isLoading}
-              >
-                {isGallery ? <Images size={16} /> : <Download size={16} />}
-                {isGallery ? "Listar galeria" : "Baixar"}
-              </Button>
+              />
+              <p className={`text-xs text-center ${isDark ? 'text-[#6a6a6a]' : 'text-[#999999]'}`}>
+                Atalhos: <kbd className={`px-1.5 py-0.5 rounded text-xs ${isDark ? 'bg-[#2a2a2a]' : 'bg-[#e0e0e0]'}`}>⌘V</kbd> colar • <kbd className={`px-1.5 py-0.5 rounded text-xs ${isDark ? 'bg-[#2a2a2a]' : 'bg-[#e0e0e0]'}`}>Enter</kbd> baixar • <kbd className={`px-1.5 py-0.5 rounded text-xs ${isDark ? 'bg-[#2a2a2a]' : 'bg-[#e0e0e0]'}`}>⌘⇧V</kbd> colar e baixar • <kbd className={`px-1.5 py-0.5 rounded text-xs ${isDark ? 'bg-[#2a2a2a]' : 'bg-[#e0e0e0]'}`}>Esc</kbd> limpar
+              </p>
             </div>
-          </CardContent>
-        </Card>
 
-        <div className="space-y-4">
-          <Card>
-            <CardHeader className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-              <div>
-                <CardTitle>Resposta e prévia</CardTitle>
-                <CardDescription>
-                  Veja o blob retornado, links e JSON da chamada.
-                </CardDescription>
-              </div>
-              <div
-                className={cn(
-                  "px-3 py-1.5 rounded-full text-xs font-semibold",
-                  toneClasses[statusTone]
-                )}
-              >
-                {statusMsg}
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <Tabs defaultValue="preview">
-                <TabsList>
-                  <TabsTrigger value="preview">
-                    <Video size={16} className="mr-2" />
-                    Prévia
-                  </TabsTrigger>
-                  <TabsTrigger value="json">JSON</TabsTrigger>
-                  <TabsTrigger value="links">Links</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="preview" className="space-y-3">
-                  <div className="rounded-xl border border-border bg-secondary/40 p-3 min-h-[240px]">
-                    {preview.kind === "image" && (
-                      <img
-                        src={preview.url}
-                        alt="preview"
-                        className="w-full max-h-[420px] object-contain rounded-lg"
-                      />
-                    )}
-                    {preview.kind === "video" && (
-                      <video
-                        controls
-                        className="w-full max-h-[420px] rounded-lg bg-black"
-                        src={preview.url}
-                      />
-                    )}
-                    {preview.kind === "gallery" && (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                        {preview.urls.map((u, i) => (
-                          <div
-                            key={u + i}
-                            className="rounded-lg border border-border bg-secondary/40 p-2 flex flex-col gap-2"
-                          >
-                            <img
-                              src={u}
-                              alt={`item-${i + 1}`}
-                              className="w-full h-32 object-cover rounded-md"
-                              loading="lazy"
-                            />
-                            <Button asChild variant="outline" size="sm">
-                              <a href={u} download target="_blank" rel="noreferrer">
-                                Download {i + 1}
-                              </a>
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {preview.kind === "none" && (
-                      <div className="h-32 flex items-center justify-center text-muted-foreground">
-                        Sem preview ainda.
-                      </div>
-                    )}
-                  </div>
-                </TabsContent>
-
-                <TabsContent value="json">
-                  <div className="rounded-xl border border-border bg-secondary/40 p-3 overflow-auto max-h-[320px] text-xs">
-                    <pre>{JSON.stringify(jsonResult, null, 2)}</pre>
-                  </div>
-                </TabsContent>
-
-                <TabsContent value="links">
-                  <div className="space-y-3">
-                    {galleryLinks.length === 0 && (
-                      <p className="text-sm text-muted-foreground">
-                        Nenhum link retornado.
-                      </p>
-                    )}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                      {galleryLinks.map((u, idx) => (
-                        <div
-                          key={u + idx}
-                          className="flex items-center gap-2 rounded-lg border border-border bg-secondary/40 p-2"
-                        >
-                          <span className="text-xs text-muted-foreground w-8">
-                            #{idx + 1}
-                          </span>
-                          <a
-                            href={u}
-                            className="text-sm text-accent underline underline-offset-2 break-all"
-                            target="_blank"
-                            rel="noreferrer"
-                            download
-                          >
-                            {u}
-                          </a>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </TabsContent>
-              </Tabs>
-
-              <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
-                {meta.map((item) => (
-                  <span
-                    key={item}
-                    className="px-3 py-1 rounded-full border border-border bg-secondary/40"
-                  >
-                    {item}
-                  </span>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-
-      <Card className="border border-primary/40">
-        <CardHeader className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-          <div>
-            <CardTitle>Áudio e transcrição</CardTitle>
-            <CardDescription className="text-muted-foreground/90">
-              Extraia áudio de vídeos, transcreva vídeo/áudio e transforme imagens em texto.
-            </CardDescription>
-          </div>
-          <div className="flex gap-2 text-xs text-muted-foreground">
-            Usa a mesma base e API Key das chamadas principais.
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 md:grid-cols-3">
-            <section className="rounded-xl border border-border bg-secondary/40 p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <div className="w-9 h-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
-                  <FileAudio size={16} />
-                </div>
-                <div>
-                  <p className="text-sm font-semibold">Extrair áudio de vídeo</p>
-                  <p className="text-xs text-muted-foreground">
-                    Baixa só o áudio via yt-dlp.
-                  </p>
-                </div>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">URL</label>
-                <input
-                  value={audioUrl}
-                  onChange={(e) => setAudioUrl(e.target.value)}
-                  placeholder="https://..."
-                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">Formato do áudio</label>
-                <select
-                  value={audioFormat}
-                  onChange={(e) => setAudioFormat(e.target.value as AudioFormat)}
-                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                >
-                  <option value="mp3">mp3</option>
-                  <option value="m4a">m4a</option>
-                  <option value="wav">wav</option>
-                </select>
-              </div>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {audioMutation.isPending && (
-                  <RefreshCcw size={14} className="animate-spin" />
-                )}
-                <span>{audioStatus}</span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  variant="default"
-                  size="sm"
-                  className="gap-2"
-                  onClick={handleAudioExtract}
-                  disabled={audioMutation.isPending}
-                >
-                  <FileAudio size={16} />
-                  Extrair áudio
-                </Button>
-                {audioResult && (
-                  <Button asChild variant="outline" size="sm" className="gap-2">
-                    <a href={audioResult.url} download>
-                      Download
-                    </a>
-                  </Button>
-                )}
-              </div>
-              {audioResult && (
-                <p className="text-xs text-muted-foreground">{audioResult.meta}</p>
-              )}
-            </section>
-
-            <section className="rounded-xl border border-border bg-secondary/40 p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <div className="w-9 h-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
-                  <FileText size={16} />
-                </div>
-                <div>
-                  <p className="text-sm font-semibold">Transcrever vídeo</p>
-                  <p className="text-xs text-muted-foreground">
-                    Baixa o áudio e envia para Whisper.
-                  </p>
-                </div>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">URL</label>
-                <input
-                  value={transcribeUrl}
-                  onChange={(e) => setTranscribeUrl(e.target.value)}
-                  placeholder="https://..."
-                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-2">
-                  <label className="text-sm font-semibold">Formato</label>
-                  <select
-                    value={transcribeFormat}
-                    onChange={(e) =>
-                      setTranscribeFormat(e.target.value as AudioFormat)
-                    }
-                    className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  >
-                    <option value="mp3">mp3</option>
-                    <option value="m4a">m4a</option>
-                    <option value="wav">wav</option>
-                  </select>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-semibold">Idioma (opcional)</label>
-                  <input
-                    value={transcribeLang}
-                    onChange={(e) => setTranscribeLang(e.target.value)}
-                    placeholder="pt"
-                    className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            <motion.button
+              onClick={handleDownload}
+              disabled={!url || isLoading}
+              className={`w-full py-4 rounded-xl font-semibold transition-colors flex items-center justify-center gap-2 ${
+                url && !isLoading
+                  ? isDark ? 'bg-[#4a4a4a] text-white hover:bg-[#5a5a5a]' : 'bg-[#1a1a1a] text-white hover:bg-[#2a2a2a]'
+                  : isDark ? 'bg-[#1a1a1a] text-[#4a4a4a] cursor-not-allowed' : 'bg-[#e0e0e0] text-[#999999] cursor-not-allowed'
+              }`}
+              whileHover={url && !isLoading ? { scale: 1.02 } : {}}
+              whileTap={url && !isLoading ? { scale: 0.98 } : {}}
+            >
+              {isLoading ? (
+                <>
+                  <motion.div
+                    className="w-5 h-5 border-2 border-current border-t-transparent rounded-full"
+                    animate={{ rotate: 360 }}
+                    transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                   />
-                </div>
-              </div>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {transcribeMutation.isPending && (
-                  <RefreshCcw size={14} className="animate-spin" />
-                )}
-                <span>{transcribeStatus}</span>
-              </div>
-              <Button
-                variant="default"
-                size="sm"
-                className="gap-2"
-                onClick={handleTranscribeVideo}
-                disabled={transcribeMutation.isPending}
-              >
-                <FileText size={16} />
-                Transcrever vídeo
-              </Button>
-              <div className="rounded-lg border border-border bg-background/60 p-2 text-xs min-h-[80px] max-h-[200px] overflow-auto">
-                {transcript ? (
-                  <p className="whitespace-pre-wrap">{transcript}</p>
-                ) : (
-                  <p className="text-muted-foreground">Transcrição aparecerá aqui.</p>
-                )}
-              </div>
-            </section>
+                  Processando...
+                </>
+              ) : (
+                <>
+                  <Download className="w-5 h-5" />
+                  {downloadType === 'video' && 'Baixar Vídeo'}
+                  {downloadType === 'images' && 'Baixar e Transcrever Imagens'}
+                  {downloadType === 'audio' && 'Baixar e Transcrever Áudio'}
+                </>
+              )}
+            </motion.button>
 
-            <section className="rounded-xl border border-border bg-secondary/40 p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <div className="w-9 h-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
-                  <ImageIcon size={16} />
-                </div>
-                <div>
-                  <p className="text-sm font-semibold">Transcrever imagem (Instagram)</p>
-                  <p className="text-xs text-muted-foreground">
-                    Extrai texto de carrosséis do Instagram via gallery-dl + OpenAI Vision.
-                  </p>
-                </div>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">URL do post (carrossel)</label>
-                <input
-                  value={instaUrl}
-                  onChange={(e) => setInstaUrl(e.target.value)}
-                  placeholder="https://www.instagram.com/p/..."
-                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">Máximo de imagens</label>
-                <input
-                  type="number"
-                  value={instaMax}
-                  min={1}
-                  max={10}
-                  onChange={(e) => setInstaMax(Number(e.target.value) || 1)}
-                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-semibold">Prompt (opcional)</label>
-                <input
-                  value={imagePrompt}
-                  onChange={(e) => setImagePrompt(e.target.value)}
-                  placeholder="Extraia todo o texto..."
-                  className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                />
-              </div>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {imageMutation.isPending && (
-                  <RefreshCcw size={14} className="animate-spin" />
-                )}
-                <span>{imageStatus}</span>
-              </div>
-              <Button
-                variant="default"
-                size="sm"
-                className="gap-2"
-                onClick={handleTranscribeImage}
-                disabled={imageMutation.isPending}
-              >
-                <ImageIcon size={16} />
-                Transcrever imagem
-              </Button>
-              <div className="rounded-lg border border-border bg-background/60 p-2 text-xs min-h-[80px] max-h-[200px] overflow-auto space-y-2">
-                {imageTexts.length === 0 && (
-                  <p className="text-muted-foreground">
-                    Os textos extraídos aparecerão aqui.
-                  </p>
-                )}
-                {imageTexts.map((item) => (
-                  <div key={item.index} className="space-y-1">
-                    <p className="font-semibold text-primary">
-                      Imagem #{item.index} {item.file ? `(${item.file})` : ""}
-                    </p>
-                    {item.error ? (
-                      <p className="text-red-500">{item.error}</p>
-                    ) : (
-                      <p className="whitespace-pre-wrap">{item.text}</p>
-                    )}
+            {/* Progress Bar */}
+            <AnimatePresence>
+              {isLoading && progress > 0 && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="w-full mt-4"
+                >
+                  <div className={`w-full h-2 rounded-full overflow-hidden ${isDark ? 'bg-[#1a1a1a]' : 'bg-[#e0e0e0]'}`}>
+                    <motion.div
+                      className={`h-full ${isDark ? 'bg-[#4a4a4a]' : 'bg-[#1a1a1a]'}`}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${progress}%` }}
+                      transition={{ duration: 0.3, ease: 'easeOut' }}
+                    />
                   </div>
-                ))}
+                  <p className={`text-xs text-center mt-2 ${isDark ? 'text-[#6a6a6a]' : 'text-[#999999]'}`}>
+                    {progress < 95 ? `Processando... ${Math.round(progress)}%` : 'Finalizando...'}
+                  </p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+
+          {/* Error Display */}
+          {error && (
+            <motion.div
+              className={`${
+                isDark ? 'bg-red-900/20 border-red-900/50' : 'bg-red-100 border-red-300'
+              } border rounded-xl p-4`}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+            >
+              <p className={`text-sm ${isDark ? 'text-red-400' : 'text-red-800'}`}>{error}</p>
+            </motion.div>
+          )}
+
+          {/* Results Display */}
+          {result && result.type === 'video' && (
+            <motion.div
+              className={`${
+                isDark ? 'bg-[#1a1a1a] border-[#2a2a2a]' : 'bg-white border-[#e0e0e0]'
+              } border rounded-xl p-6 text-center`}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+            >
+              <p className="text-lg font-medium mb-2">✅ Download iniciado!</p>
+              <p className={`text-sm ${isDark ? 'text-[#a0a0a0]' : 'text-[#666666]'}`}>
+                {result.filename}
+              </p>
+              <p className={`text-sm ${isDark ? 'text-[#8a8a8a]' : 'text-[#888888]'} mt-1`}>
+                {result.fileSize}
+              </p>
+              <p className={`text-xs mt-2 ${isDark ? 'text-[#6a6a6a]' : 'text-[#999999]'}`}>
+                O arquivo está sendo baixado automaticamente
+              </p>
+            </motion.div>
+          )}
+
+          {result && result.type === 'carousel' && (
+            <ImageCarouselResult
+              images={result.images}
+              onDownloadImage={handleImageDownload}
+              onDownloadAll={handleDownloadAllImages}
+              isDark={isDark}
+            />
+          )}
+
+          {result && result.type === 'audio' && (
+            <AudioResult transcription={result.transcription} isDark={isDark} />
+          )}
+
+          {/* Info Box */}
+          <motion.div 
+            className={`${isDark ? 'bg-[#1a1a1a] border-[#2a2a2a]' : 'bg-white border-[#e0e0e0]'} border rounded-xl p-4`}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.4 }}
+          >
+            <div className="flex gap-3">
+              <Info className={`w-5 h-5 ${isDark ? 'text-[#6a6a6a]' : 'text-[#999999]'} flex-shrink-0 mt-0.5`} />
+              <div className="space-y-2">
+                <p className={`text-sm ${isDark ? 'text-[#a0a0a0]' : 'text-[#666666]'}`}>
+                  <strong className={isDark ? 'text-white' : 'text-[#1a1a1a]'}>Plataformas suportadas:</strong> Instagram (posts, reels, stories, carrosséis), 
+                  YouTube (vídeos, shorts), TikTok (vídeos), X/Twitter (vídeos, imagens)
+                </p>
+                <p className={`text-sm ${isDark ? 'text-[#a0a0a0]' : 'text-[#666666]'}`}>
+                  <strong className={isDark ? 'text-white' : 'text-[#1a1a1a]'}>Recursos:</strong> Downloads diretos, transcrição de carrossel de imagens, 
+                  transcrição de áudio
+                </p>
               </div>
-            </section>
-          </div>
-        </CardContent>
-      </Card>
+            </div>
+          </motion.div>
+
+          {/* Settings Panel */}
+          <AnimatePresence>
+            {showSettings && (
+              <SettingsPanel 
+                isDark={isDark} 
+                onClose={() => setShowSettings(false)}
+                onSettingsChange={handleSettingsChange}
+              />
+            )}
+          </AnimatePresence>
+        </div>
+      </main>
+
+      {/* Footer */}
+      <Footer isDark={isDark} />
     </div>
   );
 }

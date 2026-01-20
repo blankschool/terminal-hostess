@@ -13,6 +13,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, HttpUrl
 import subprocess
 import shutil
@@ -31,6 +32,11 @@ from starlette.background import BackgroundTask
 from openai import OpenAI
 import base64
 import mimetypes
+import re
+import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import requests
 
 # Configuração de logging
 logging.basicConfig(
@@ -45,13 +51,23 @@ CONFIG_DIR = ROOT_DIR / "config"
 COOKIES_DIR = CONFIG_DIR / "cookies"
 FRONTEND_DIR = ROOT_DIR / "frontend"
 FRONTEND_BUILD_DIR = FRONTEND_DIR / "dist"
-DOWNLOADS_DIR = ROOT_DIR / "downloads"
+# Use temporary directory for downloads (auto-cleanup)
+DOWNLOADS_DIR = Path(tempfile.gettempdir()) / "n8n-download-bridge"
 
-# Configurações
+# Configurações - Load .env BEFORE importing cobalt_config
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(CONFIG_DIR / ".env", override=False)
+
+# Import Cobalt after environment variables are loaded
+sys.path.insert(0, str(ROOT_DIR / "backend"))
+from lib.cobalt_client import CobaltClient, CobaltAPIError, CobaltRateLimitError
+from config import cobalt_config
 DEFAULT_API_KEY = "cI4cA4Xvml2O0TCXdxRDuhHdY1251G34gso3VdHfDIc"
 API_KEY = os.getenv("API_KEY", DEFAULT_API_KEY)
+DEFAULT_TRANSCRIBE_PROMPT = (
+    "Atue como um transcritor de documentos. Analise a imagem fornecida e "
+    "transcreva todo o texto visível exatamente como ele aparece."
+)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_AUDIO_MODEL = os.getenv("OPENAI_AUDIO_MODEL", "whisper-1")
 OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
@@ -147,6 +163,7 @@ _yt_dlp_path_cache: Optional[str] = None
 _gallery_dl_path_cache: Optional[str] = None
 _ffmpeg_path_cache: Optional[str] = None
 _openai_client: Optional[OpenAI] = None
+_cobalt_client: Optional[CobaltClient] = None
 
 
 def _is_executable(path: Path) -> bool:
@@ -209,24 +226,24 @@ def get_ffmpeg_location_arg() -> list[str]:
 
 def choose_yt_dlp_binary_for_url(url: str) -> str:
     """
-    Fixa o binário principal; para TikTok, prioriza ./bin/yt-dlp (impersonation).
+    Para TikTok, usa ./bin/yt-dlp se disponível (tem curl_cffi para impersonation).
+    Para outras URLs, usa o binário do sistema (Homebrew/PATH).
     """
     lower = url.lower()
-    main_bin = get_yt_dlp_binary()
     if "tiktok.com" in lower:
         alt_bin = str(ROOT_DIR / "bin" / "yt-dlp")
         if _is_executable(Path(alt_bin)):
             return alt_bin
-    return main_bin
+    return get_yt_dlp_binary()
 
 
 def get_yt_dlp_binary() -> str:
     """
-    Resolve binário do yt-dlp priorizando a instalação estável (pip/venv).
+    Resolve binário do yt-dlp priorizando Homebrew/PATH.
     Ordem:
     1) YT_DLP_PATH (override explícito)
-    2) Binário do venv (pip)
-    3) yt-dlp do PATH
+    2) yt-dlp do PATH (Homebrew)
+    3) Binário do venv (pip)
     4) Repo local yt-dlp-master (download do GitHub) como fallback
     """
     global _yt_dlp_path_cache
@@ -244,13 +261,14 @@ def get_yt_dlp_binary() -> str:
 
     candidates: list[str] = []
 
-    venv_bin = Path(sys.executable).parent / "yt-dlp"
-    if _is_executable(venv_bin):
-        candidates.append(str(venv_bin))
-
+    # Priorizar yt-dlp do PATH (Homebrew)
     path_bin = shutil.which("yt-dlp")
     if path_bin:
         candidates.append(path_bin)
+
+    venv_bin = Path(sys.executable).parent / "yt-dlp"
+    if _is_executable(venv_bin):
+        candidates.append(str(venv_bin))
 
     local_repo = ROOT_DIR / "yt-dlp-master"
     for name in ("yt-dlp.sh", "yt-dlp"):
@@ -316,6 +334,130 @@ def get_gallery_dl_binary() -> str:
     return _gallery_dl_path_cache
 
 
+def download_tiktok_audio_via_tikwm(url: str, output_dir: Path, audio_format: str = "mp3") -> Path:
+    """
+    Baixa vídeo TikTok via tikwm.com e extrai o áudio usando ffmpeg.
+    Retorna o caminho do arquivo de áudio.
+    Optimized with reduced timeouts.
+    """
+    logger.info(f"🎵 Baixando TikTok e extraindo áudio via tikwm.com: {url}")
+
+    try:
+        # Primeiro, baixar o vídeo via tikwm
+        video_result = download_tiktok_via_tikwm(url, output_dir)
+        video_path = Path(video_result["file_path"])
+
+        # Gerar nome do arquivo de áudio
+        audio_filename = video_path.stem + f".{audio_format}"
+        audio_path = output_dir / audio_filename
+
+        # Extrair áudio usando ffmpeg
+        ffmpeg_bin = resolve_ffmpeg_binary()
+        cmd = [
+            ffmpeg_bin,
+            "-i", str(video_path),
+            "-vn",  # sem vídeo
+            "-acodec", "libmp3lame" if audio_format == "mp3" else "copy",
+            "-y",  # sobrescrever
+            str(audio_path)
+        ]
+
+        logger.info(f"Extraindo áudio com ffmpeg: {' '.join(cmd)}")
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)  # Reduced from 120s to 60s
+
+        # Remover arquivo de vídeo temporário
+        video_path.unlink(missing_ok=True)
+        logger.info(f"✅ Áudio extraído com sucesso via tikwm.com: {audio_path}")
+
+        return audio_path
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Erro ao extrair áudio com ffmpeg: {e.stderr}")
+        raise Exception(f"Falha ao extrair áudio: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erro ao baixar TikTok e extrair áudio: {e}")
+        raise
+
+
+def download_tiktok_via_tikwm(url: str, output_dir: Path) -> dict:
+    """
+    Download de TikTok usando a API gratuita do tikwm.com.
+    OPTIMIZED for maximum speed: reduced timeouts, larger chunks, connection reuse.
+    """
+    from time import perf_counter
+    t0 = perf_counter()
+    
+    # Use session for connection reuse (faster)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Connection": "keep-alive",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate",
+    })
+
+    try:
+        # Fast API call with reduced timeout
+        api_url = f"https://www.tikwm.com/api/?url={url}"
+        t1 = perf_counter()
+        resp = session.get(api_url, timeout=8, verify=False)  # Faster: 8s timeout, skip SSL verification
+        resp.raise_for_status()
+        data = resp.json()
+        t2 = perf_counter()
+        logger.info(f"⚡ tikwm API responded in {(t2-t1)*1000:.0f}ms")
+
+        if data.get("code") != 0:
+            raise Exception(f"API tikwm retornou erro: {data.get('msg', 'Unknown error')}")
+
+        video_data = data.get("data", {})
+
+        # Get video URL (prefer no watermark)
+        video_url = video_data.get("play") or video_data.get("wmplay")
+        if not video_url:
+            raise Exception("Nenhuma URL de vídeo encontrada na resposta do tikwm")
+
+        # Generate filename
+        video_id = video_data.get("id", "tiktok")
+        author = video_data.get("author", {}).get("unique_id", "unknown")
+        filename = f"tiktok_{author}_{video_id}.mp4"
+        file_path = output_dir / filename
+
+        # Fast video download with larger chunks
+        t3 = perf_counter()
+        video_resp = session.get(video_url, timeout=30, stream=True, verify=False)
+        video_resp.raise_for_status()
+
+        # Use 64KB chunks for faster I/O
+        with open(file_path, "wb") as f:
+            for chunk in video_resp.iter_content(chunk_size=65536):  # 64KB chunks
+                if chunk:
+                    f.write(chunk)
+
+        t4 = perf_counter()
+        file_size = file_path.stat().st_size
+        size_mb = file_size / (1024 * 1024)
+        total_time = t4 - t0
+        speed_mbps = (size_mb * 8) / total_time if total_time > 0 else 0
+        logger.info(f"⚡ TikTok downloaded: {size_mb:.2f}MB in {total_time:.2f}s ({speed_mbps:.1f} Mbps)")
+
+        return {
+            "success": True,
+            "file_path": str(file_path),
+            "file_size": get_file_size(file_path),
+            "format": "mp4",
+            "title": video_data.get("title", ""),
+            "author": author,
+            "source": "tikwm"
+        }
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erro de rede ao usar tikwm: {e}")
+        raise Exception(f"Falha na API tikwm: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erro ao usar tikwm: {e}")
+        raise
+
+
 def get_impersonate_args(url: str) -> list[str]:
     """
     Retorna args de impersonation para TikTok (Chrome-120).
@@ -341,6 +483,433 @@ def get_openai_client() -> OpenAI:
     return _openai_client
 
 
+def get_cobalt_client() -> CobaltClient:
+    """Retorna cliente Cobalt com cache."""
+    global _cobalt_client
+    if _cobalt_client:
+        return _cobalt_client
+    
+    api_url = cobalt_config.get_cobalt_url()
+    api_key = cobalt_config.COBALT_API_KEY
+    timeout = cobalt_config.COBALT_TIMEOUT
+    
+    _cobalt_client = CobaltClient(
+        api_url=api_url,
+        api_key=api_key,
+        timeout=timeout
+    )
+    logger.info(f"Cobalt client initialized: {api_url}")
+    return _cobalt_client
+
+
+def download_via_cobalt(url: str, audio_only: bool = False, quality: str = "max") -> dict:
+    """
+    Download media using Cobalt API.
+    Returns dict with:
+        - blob: bytes of the downloaded file
+        - filename: suggested filename
+        - content_type: MIME type
+    """
+    t0 = perf_counter()
+    client = get_cobalt_client()
+    platform = detectPlatform(url)  # Detect platform early for use throughout function
+    
+    try:
+        logger.info(f"Downloading via Cobalt: {url} (audio_only={audio_only}, quality={quality})")
+        
+        # Get download info from Cobalt
+        result = client.download(
+            url=url,
+            quality=quality,
+            audio_only=audio_only,
+            audio_format="mp3" if audio_only else "best",
+        )
+        
+        status = result.get("status")
+        t1 = perf_counter()
+        logger.info(f"Cobalt response received in {(t1 - t0) * 1000:.0f}ms, status={status}")
+        
+        # Handle different response types
+        download_url = None
+        
+        if status == "redirect" or status == "stream" or status == "tunnel":
+            download_url = result.get("url")
+        elif status == "picker":
+            # Multiple options (e.g., Twitter with multiple videos)
+            urls = result.get("picker", [])
+            if urls:
+                download_url = urls[0].get("url")
+        
+        if not download_url:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Cobalt returned unexpected status: {status}"
+            )
+        
+        # Download the actual file with optimized settings
+        t2 = perf_counter()
+        # Use session for connection pooling and keep-alive
+        download_session = requests.Session()
+        download_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Referer": url,
+        })
+        response = download_session.get(
+            download_url, 
+            timeout=30,  # Reduced timeout for faster failure
+            stream=True,
+            allow_redirects=True,
+            verify=False,  # Skip SSL verification for speed
+        )
+        response.raise_for_status()
+        
+        # Get filename from Content-Disposition
+        filename = None
+        content_disposition = response.headers.get("Content-Disposition", "")
+        if "filename=" in content_disposition:
+            filename = content_disposition.split("filename=")[-1].strip('"')
+        
+        # Fallback filename
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext = "mp3" if audio_only else "mp4"
+            content_type = response.headers.get("Content-Type", "")
+            if "webm" in content_type:
+                ext = "webm"
+            filename = f"{platform}_{timestamp}.{ext}"
+        
+        # Check Content-Length header before downloading
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                expected_size = int(content_length)
+                if expected_size == 0:
+                    logger.error(f"❌ Content-Length is 0 for {url} (platform: {platform})")
+                    if cobalt_config.ENABLE_YTDLP_FALLBACK:
+                        logger.info("🔄 Falling back to yt-dlp due to zero Content-Length")
+                        return download_via_ytdlp_fallback(url, audio_only)
+                    raise HTTPException(status_code=500, detail="Download failed: Content-Length is 0")
+            except ValueError:
+                pass  # Invalid Content-Length, continue with download
+        
+        # Read the file content with larger chunks for speed
+        content = b""
+        for chunk in response.iter_content(chunk_size=65536):  # 64KB chunks for faster I/O
+            if chunk:
+                content += chunk
+        
+        t3 = perf_counter()
+        size_mb = len(content) / (1024 * 1024)
+        
+        # Validate that content is not empty
+        if len(content) == 0:
+            logger.error(f"❌ Empty content received from Cobalt for {url} (platform: {platform}, status: {status})")
+            logger.error(f"   Download URL: {download_url[:200]}...")
+            logger.error(f"   Response headers: {dict(response.headers)}")
+            if cobalt_config.ENABLE_YTDLP_FALLBACK:
+                logger.info("🔄 Falling back to yt-dlp due to empty content")
+                return download_via_ytdlp_fallback(url, audio_only)
+            raise HTTPException(status_code=500, detail="Download failed: empty content from Cobalt")
+        
+        logger.info(f"✅ Downloaded {size_mb:.2f}MB via Cobalt in {(t3 - t2) * 1000:.0f}ms")
+        logger.info(f"🏁 Total Cobalt download time for {platform}: {(t3 - t0) * 1000:.0f}ms")
+        
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        
+        return {
+            "blob": content,
+            "filename": filename,
+            "content_type": content_type,
+            "size": len(content)
+        }
+        
+    except CobaltRateLimitError as e:
+        logger.error(f"Cobalt rate limit: {e}")
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit excedido. Tente novamente em alguns minutos."
+        )
+    
+    except CobaltAPIError as e:
+        error_msg = str(e)
+        logger.error(f"❌ Cobalt API error: {error_msg}")
+        
+        # Check if it's a TikTok-specific error (platform already defined at function start)
+        is_tiktok = platform == "tiktok"
+        is_tiktok_error = "tiktok" in error_msg.lower() or "fetch.fail" in error_msg.lower()
+        
+        if is_tiktok or is_tiktok_error:
+            logger.warning(f"⚠️  TikTok detected with Cobalt failure - using optimized fallback")
+            if cobalt_config.ENABLE_YTDLP_FALLBACK:
+                logger.info("🔄 Falling back to yt-dlp for TikTok...")
+                return download_via_ytdlp_fallback(url, audio_only)
+        
+        # Check if it's the API shutdown error
+        if "shut down" in error_msg.lower() or "v7" in error_msg.lower():
+            logger.warning("Cobalt API unavailable - using yt-dlp fallback")
+            if cobalt_config.ENABLE_YTDLP_FALLBACK:
+                logger.info("Usando yt-dlp como fallback...")
+                return download_via_ytdlp_fallback(url, audio_only)
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Cobalt API indisponível. Considere usar uma instância auto-hospedada do Cobalt ou habilitar o fallback para yt-dlp."
+                )
+        
+        # Optional fallback to yt-dlp for other errors
+        if cobalt_config.ENABLE_YTDLP_FALLBACK:
+            logger.info("🔄 Tentando fallback para yt-dlp...")
+            # Use the old method as fallback
+            return download_via_ytdlp_fallback(url, audio_only)
+        
+        raise HTTPException(
+            status_code=503,
+            detail=f"Erro ao baixar via Cobalt: {str(e)}. Considere usar uma instância auto-hospedada."
+        )
+    
+    except Exception as e:
+        logger.error(f"Unexpected error in Cobalt download: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro inesperado: {str(e)}"
+        )
+
+
+def detectPlatform(url: str) -> str:
+    """Helper function to detect platform from URL"""
+    lower_url = url.lower()
+    if "youtube.com" in lower_url or "youtu.be" in lower_url:
+        return "youtube"
+    if "tiktok.com" in lower_url:
+        return "tiktok"
+    if "instagram.com" in lower_url:
+        return "instagram"
+    if "twitter.com" in lower_url or "x.com" in lower_url:
+        return "twitter"
+    return "video"
+
+
+def download_via_ytdlp_fallback(url: str, audio_only: bool = False) -> dict:
+    """
+    Fallback to yt-dlp if Cobalt fails.
+    OPTIMIZED for maximum download speed while maintaining max quality.
+    Uses aria2c multi-threading when available.
+    """
+    from time import perf_counter
+    t_start = perf_counter()
+    platform = detectPlatform(url)
+    logger.info(f"⚡ Using OPTIMIZED yt-dlp fallback for {platform}: {url}")
+    
+    # Use the existing yt-dlp infrastructure
+    if audio_only:
+        # Use audio extraction
+        audio_path = download_audio_from_url(url, "mp3")
+        with open(audio_path, "rb") as f:
+            content = f.read()
+        audio_path.unlink(missing_ok=True)
+        
+        t_end = perf_counter()
+        logger.info(f"✅ Audio downloaded via yt-dlp fallback for {platform} in {(t_end - t_start) * 1000:.0f}ms")
+        
+        return {
+            "blob": content,
+            "filename": audio_path.name,
+            "content_type": "audio/mpeg",
+            "size": len(content)
+        }
+    else:
+        # Use video download with optimizations
+        result = execute_ytdlp_optimized(url, output_format="mp4")
+        file_path = Path(result["file_path"])
+        
+        with open(file_path, "rb") as f:
+            content = f.read()
+        
+        filename = file_path.name
+        file_path.unlink(missing_ok=True)
+        
+        t_end = perf_counter()
+        size_mb = len(content) / (1024 * 1024)
+        speed_mbps = (size_mb * 8) / ((t_end - t_start) or 1)  # Avoid division by zero
+        logger.info(f"✅ Video downloaded via yt-dlp fallback for {platform}: {size_mb:.2f}MB in {(t_end - t_start):.1f}s ({speed_mbps:.1f} Mbps)")
+        
+        return {
+            "blob": content,
+            "filename": filename,
+            "content_type": "video/mp4",
+            "size": len(content)
+        }
+
+
+def sanitize_filename(filename: str, max_length: int = 200) -> str:
+    """
+    Sanitize filename to be filesystem-safe and limit length.
+    Removes invalid characters and truncates if too long.
+    """
+    # Remove invalid characters for filenames
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    
+    # Remove leading/trailing spaces and dots
+    filename = filename.strip('. ')
+    
+    # Truncate if too long (leave room for extension)
+    if len(filename) > max_length:
+        filename = filename[:max_length]
+    
+    # If empty after sanitization, use fallback
+    if not filename:
+        filename = "video"
+    
+    return filename
+
+
+def extract_username_from_instagram_url(original_url: str) -> str:
+    """
+    Extract Instagram username from URL.
+    Tries to find username in URL patterns, returns sanitized name or fallback.
+    
+    Examples:
+        https://www.instagram.com/username/reel/ID → username
+        https://www.instagram.com/reel/ID → instagram (fallback)
+        https://www.instagram.com/p/ID → instagram (fallback)
+    """
+    # Pattern: /username/content_type/ID
+    # Match format like: instagram.com/USERNAME/(reel|p|stories)/...
+    match = re.search(r'instagram\.com/([^/]+)/(reel|p|stories|tv)/', original_url)
+    if match:
+        username = match.group(1)
+        # Exclude reserved paths that aren't usernames
+        if username not in ['reel', 'p', 'stories', 'tv', 'explore', 'accounts']:
+            return sanitize_filename(username, max_length=50)
+    
+    # Try alternative pattern: /username/ at the end or followed by query params
+    match = re.search(r'instagram\.com/([^/?#]+)/?(?:\?|#|$)', original_url)
+    if match:
+        username = match.group(1)
+        if username not in ['reel', 'p', 'stories', 'tv', 'explore', 'accounts']:
+            return sanitize_filename(username, max_length=50)
+    
+    # Fallback
+    return "instagram"
+
+
+def execute_ytdlp_optimized(url: str, output_format: str = "mp4") -> dict:
+    """
+    yt-dlp execution with BEST QUALITY (no aggressive optimizations).
+    Simple and reliable download with best available formats.
+    Uses uploader name or video title as filename.
+    """
+    t0 = perf_counter()
+    platform = detectPlatform(url)
+    
+    # Use meaningful filenames: uploader name or video title
+    # YouTube: %(title)s gives the video title
+    # Instagram: %(uploader)s gives the account name
+    # TikTok: %(uploader)s gives the username
+    if platform == "youtube":
+        # For YouTube, use video title as filename
+        output_template = str(DOWNLOADS_DIR / "%(title)s.%(ext)s")
+    else:
+        # For other platforms, use uploader/username
+        output_template = str(DOWNLOADS_DIR / "%(uploader)s_%(id)s.%(ext)s")
+    
+    cmd = [choose_yt_dlp_binary_for_url(url)]
+    cmd.extend(get_cookies_args(url))
+    cmd.extend(get_impersonate_args(url))
+    cmd.extend(get_ffmpeg_location_arg())
+    
+    # UNIVERSAL COMPATIBILITY DOWNLOAD
+    cmd.extend([
+        # Format selection: Prioritize H.264 video + AAC audio for universal playback
+        # This ensures the video plays on ALL devices/players without conversion
+        # Priority order:
+        #   1. MP4 with H.264 (avc1) video + M4A audio
+        #   2. Any MP4 video + M4A audio
+        #   3. Best MP4 available
+        #   4. Best format available (fallback)
+        '-f', 'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        
+        # Post-processing: Re-encode if needed to ensure H.264 + AAC
+        # This guarantees compatibility even if source format is VP9/AV1/OPUS
+        '--postprocessor-args', 'ffmpeg:-c:v libx264 -c:a aac',
+        '--recode-video', 'mp4',
+        
+        # Merge to MP4 container
+        '--merge-output-format', 'mp4',
+        
+        # Basic settings
+        '--no-check-certificate',
+        '--no-playlist',
+        
+        # Restrict filename length and sanitize
+        '--restrict-filenames',  # ASCII-only filenames
+        '--trim-filenames', '200',  # Limit filename length
+        
+        # Output
+        '-o', output_template,
+        '--progress',
+        '--newline',
+    ])
+    
+    cmd.append(url)
+    logger.info(f"⚡ Executing optimized yt-dlp: {' '.join(cmd[:10])}...")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout for large files
+        )
+        
+        t1 = perf_counter()
+        
+        if result.returncode != 0:
+            logger.error(f"yt-dlp error: {result.stderr}")
+            raise Exception(f"yt-dlp failed: {result.stderr[:500]}")
+        
+        # Find the downloaded file (search by pattern since filename is dynamic)
+        downloaded_files = sorted(
+            DOWNLOADS_DIR.glob("*.mp4"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        
+        if not downloaded_files:
+            raise Exception("No file downloaded")
+        
+        # Get the most recently modified file (the one we just downloaded)
+        file_path = downloaded_files[0]
+        file_size = file_path.stat().st_size
+        size_mb = file_size / (1024 * 1024)
+        download_time = t1 - t0
+        speed_mbps = (size_mb * 8) / (download_time or 1)
+        
+        logger.info(f"⚡ Optimized download complete: {size_mb:.1f}MB in {download_time:.1f}s ({speed_mbps:.1f} Mbps)")
+        logger.info(f"📁 Filename: {file_path.name}")
+        
+        return {
+            "success": True,
+            "file_path": str(file_path),
+            "file_size": get_file_size(file_path),
+            "format": file_path.suffix.lstrip('.'),
+            "download_time": download_time,
+            "speed_mbps": speed_mbps,
+        }
+        
+    except subprocess.TimeoutExpired:
+        logger.error("yt-dlp timed out after 600s")
+        raise Exception("Download timed out")
+    except Exception as e:
+        logger.error(f"Optimized yt-dlp error: {e}")
+        raise
+
+
 def resolve_ffmpeg_binary() -> str:
     """Resolve o binário do ffmpeg para chamadas diretas."""
     location = get_ffmpeg_location()
@@ -352,14 +921,47 @@ def resolve_ffmpeg_binary() -> str:
 
 def download_audio_from_url(url: str, audio_format: str = "mp3") -> Path:
     """Baixa apenas o áudio usando yt-dlp e retorna o caminho do arquivo."""
+
+    # Para TikTok, tentar tikwm.com primeiro, mas fallback para yt-dlp se falhar
+    if "tiktok" in url.lower():
+        try:
+            logger.info("TikTok detectado - tentando API tikwm.com para áudio")
+            return download_tiktok_audio_via_tikwm(url, DOWNLOADS_DIR, audio_format)
+        except Exception as e:
+            logger.warning(f"tikwm.com áudio falhou: {e}. Usando yt-dlp como fallback.")
+
     t0 = perf_counter()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_template = str(DOWNLOADS_DIR / f"audio_{timestamp}.%(ext)s")
+    platform = detectPlatform(url)
+    
+    # Use meaningful filenames based on platform
+    if platform == "youtube":
+        output_template = str(DOWNLOADS_DIR / "%(title)s.%(ext)s")
+    else:
+        output_template = str(DOWNLOADS_DIR / "%(uploader)s_%(id)s.%(ext)s")
+
+    # Detectar YouTube para otimizações
+    lower_url = url.lower()
+    is_youtube = "youtube.com" in lower_url or "youtu.be" in lower_url
 
     cmd: list[str] = [choose_yt_dlp_binary_for_url(url)]
     cmd.extend(get_cookies_args(url))
     cmd.extend(get_impersonate_args(url))
     cmd.extend(get_ffmpeg_location_arg())
+
+    # Adicionar otimizações do YouTube antes da extração de áudio
+    if is_youtube:
+        cmd.extend([
+            '--extractor-args', 'youtube:player_client=android',  # Emular cliente Android
+            '--http-chunk-size', '10M',  # Chunks de 10MB
+        ])
+        # Verificar se aria2c está disponível para multi-threading
+        if shutil.which("aria2c"):
+            cmd.extend([
+                '--external-downloader', 'aria2c',
+                '--external-downloader-args', '-x 16 -s 16 -k 1M',  # 16 conexões paralelas
+            ])
+            logger.info("YouTube áudio: Usando aria2c com 16 conexões paralelas")
+
     cmd.extend([
         "-x",
         "--audio-format",
@@ -367,6 +969,8 @@ def download_audio_from_url(url: str, audio_format: str = "mp3") -> Path:
         "-o",
         output_template,
         "--no-playlist",
+        "--restrict-filenames",  # ASCII-only filenames
+        "--trim-filenames", "200",  # Limit filename length
         "--progress",
         "--newline"
     ])
@@ -384,9 +988,17 @@ def download_audio_from_url(url: str, audio_format: str = "mp3") -> Path:
         )
         t2 = perf_counter()
 
-        downloaded_files = list(DOWNLOADS_DIR.glob(f"audio_{timestamp}.*"))
+        # Find the most recently downloaded audio file
+        audio_extensions = [f"*.{audio_format}", "*.m4a", "*.mp3", "*.opus", "*.ogg"]
+        downloaded_files = []
+        for ext in audio_extensions:
+            downloaded_files.extend(DOWNLOADS_DIR.glob(ext))
+        
         if not downloaded_files:
             raise Exception("Áudio não encontrado após download")
+        
+        # Get the most recently modified file
+        downloaded_files = sorted(downloaded_files, key=lambda p: p.stat().st_mtime, reverse=True)
 
         file_path = downloaded_files[0]
         logger.info(
@@ -400,7 +1012,16 @@ def download_audio_from_url(url: str, audio_format: str = "mp3") -> Path:
         raise HTTPException(status_code=408, detail="Download de áudio timeout (5 minutos)")
     except subprocess.CalledProcessError as exc:
         logger.error(f"Erro ao baixar áudio: {exc.stderr}")
-        raise HTTPException(status_code=500, detail=f"Erro no yt-dlp: {exc.stderr}")
+        error_msg = exc.stderr or str(exc)
+
+        # Provide more user-friendly error messages
+        if "Unable to extract" in error_msg or "Unable to download" in error_msg or "IP address is blocked" in error_msg or "Video not available" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="Falha ao extrair vídeo. O site pode ter mudado ou bloqueado o acesso."
+            )
+        else:
+            raise HTTPException(status_code=500, detail=f"Erro no download: {error_msg[:200]}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -463,6 +1084,7 @@ def transcribe_audio_file(audio_path: Path, language: Optional[str] = None) -> s
 
 def transcribe_image_bytes(data: bytes, mime_type: str = "image/png", prompt: Optional[str] = None) -> str:
     """Transcreve texto de uma imagem usando modelo vision."""
+    effective_prompt = prompt or DEFAULT_TRANSCRIBE_PROMPT
     try:
         b64 = base64.b64encode(data).decode()
         res = get_openai_client().chat.completions.create(
@@ -477,7 +1099,7 @@ def transcribe_image_bytes(data: bytes, mime_type: str = "image/png", prompt: Op
                     "content": [
                         {
                             "type": "text",
-                            "text": prompt or "Transcreva o texto desta imagem."
+                            "text": effective_prompt
                         },
                         {
                             "type": "image_url",
@@ -499,38 +1121,92 @@ def transcribe_image_bytes(data: bytes, mime_type: str = "image/png", prompt: Op
         raise HTTPException(status_code=500, detail="Falha na transcrição de imagem")
 
 
-def transcribe_instagram_carousel(url: str, prompt: Optional[str], max_items: int = 5) -> list[dict]:
-    """Baixa imagens do carrossel e transcreve cada uma."""
+def transcribe_instagram_carousel(url: str, prompt: Optional[str]) -> list[dict]:
+    """Baixa imagens do carrossel e transcreve cada uma em paralelo para maior velocidade."""
+    t0 = perf_counter()
+    
+    # First, get direct URLs (for frontend display)
+    direct_urls = execute_gallery_dl_urls(url)
+    logger.info(f"📸 Found {len(direct_urls)} direct URLs")
+    
+    # Then download and transcribe
     result = execute_gallery_dl(url)
+    t1 = perf_counter()
+    logger.info(f"⏱️ gallery-dl download: {(t1 - t0) * 1000:.0f}ms")
+
     raw_download_dir = result.get("download_dir")
     download_dir = Path(raw_download_dir) if raw_download_dir else None
     files = result.get("files", [])
     if not files:
         raise HTTPException(status_code=404, detail="Nenhuma imagem encontrada")
 
+    # Prepare tasks for parallel processing
+    tasks = []
+    for idx, info in enumerate(files, start=1):
+        file_path = Path(info.get("path", ""))
+        # Get corresponding direct URL (if available)
+        direct_url = direct_urls[idx - 1] if idx <= len(direct_urls) else None
+        
+        if not file_path.exists():
+            continue
+        if file_path.stat().st_size > 25 * 1024 * 1024:
+            tasks.append((idx, file_path, direct_url, None, "Arquivo maior que 25MB, ignorado"))
+            continue
+
+        mime, _ = mimetypes.guess_type(file_path.name)
+        mime = mime or "image/png"
+
+        # Skip video files - only transcribe images
+        if mime.startswith("video/"):
+            tasks.append((idx, file_path, direct_url, mime, "video"))
+        elif mime.startswith("image/"):
+            tasks.append((idx, file_path, direct_url, mime, "image"))
+        else:
+            tasks.append((idx, file_path, direct_url, mime, "unknown"))
+
     items = []
     try:
-        limited = files[: max_items or len(files)]
-        for idx, info in enumerate(limited, start=1):
-            file_path = Path(info.get("path", ""))
-            if not file_path.exists():
-                continue
-            if file_path.stat().st_size > 25 * 1024 * 1024:
-                items.append({
-                    "index": idx,
-                    "file": file_path.name,
-                    "error": "Arquivo maior que 25MB, ignorado"
-                })
-                continue
+        # Process images in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            def process_image(task_data):
+                idx, file_path, direct_url, mime, task_type = task_data
+                t_start = perf_counter()
 
-            mime, _ = mimetypes.guess_type(file_path.name)
-            mime = mime or "image/png"
-            text = transcribe_image_bytes(file_path.read_bytes(), mime_type=mime, prompt=prompt)
-            items.append({
-                "index": idx,
-                "file": file_path.name,
-                "text": text
-            })
+                if task_type == "video":
+                    result = {
+                        "index": idx,
+                        "file": file_path.name,
+                        "url": direct_url,
+                        "is_video": True,
+                        "text": ""
+                    }
+                    logger.info(f"⏩ Skipped video {file_path.name}")
+                    return result
+                elif task_type == "image" or task_type == "unknown":
+                    text = transcribe_image_bytes(file_path.read_bytes(), mime_type=mime, prompt=prompt)
+                    t_end = perf_counter()
+                    logger.info(f"⏱️ Transcribed {file_path.name}: {(t_end - t_start) * 1000:.0f}ms")
+                    return {
+                        "index": idx,
+                        "file": file_path.name,
+                        "url": direct_url,
+                        "is_video": False,
+                        "text": text
+                    }
+                else:
+                    return {
+                        "index": idx,
+                        "file": file_path.name,
+                        "url": direct_url,
+                        "error": task_type
+                    }
+
+            t2 = perf_counter()
+            # Execute all transcriptions in parallel
+            items = list(executor.map(process_image, tasks))
+            t3 = perf_counter()
+            logger.info(f"⏱️ Parallel transcription total: {(t3 - t2) * 1000:.0f}ms for {len(tasks)} items")
+            logger.info(f"⏱️ Total carousel processing: {(t3 - t0) * 1000:.0f}ms")
     finally:
         if download_dir and download_dir.exists():
             shutil.rmtree(download_dir, ignore_errors=True)
@@ -550,6 +1226,9 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# GZip compression for API responses (not for video/image files)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 # CORS para chamadas de browser (preflight/OPTIONS)
 app.add_middleware(
     CORSMiddleware,
@@ -557,7 +1236,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-File-Size", "X-Tool-Used", "X-Format", "X-Total-Files"],
+    expose_headers=["X-File-Size", "X-Tool-Used", "X-Format", "X-Total-Files", "X-Processing-Time-Ms"],
 )
 
 # Security
@@ -600,8 +1279,7 @@ class AudioDownloadRequest(BaseModel):
 
 class InstagramTranscribeRequest(BaseModel):
     url: HttpUrl
-    prompt: Optional[str] = None
-    max_items: Optional[int] = 5
+    prompt: Optional[str] = None  # ignorado; usamos prompt padrão
 
 
 # Dependency para validar API Key
@@ -625,12 +1303,44 @@ def get_file_size(file_path: Path) -> str:
     return f"{size:.1f}TB"
 
 
+def cleanup_path(path: Path):
+    """Remove arquivo ou diretório de forma segura (para BackgroundTask)"""
+    try:
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+                logger.info(f"Cleaned up directory: {path}")
+            else:
+                path.unlink(missing_ok=True)
+                logger.info(f"Cleaned up file: {path}")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup {path}: {e}")
+
+
 def execute_ytdlp(url: str, download_file: bool = True, output_format: str = "mp4") -> dict:
     """Executa yt-dlp e retorna informações do download"""
 
+    # Para TikTok, tentar tikwm.com primeiro, mas fallback para yt-dlp se falhar
+    if "tiktok" in url.lower() and download_file:
+        try:
+            logger.info("TikTok detectado - tentando API tikwm.com")
+            return download_tiktok_via_tikwm(url, DOWNLOADS_DIR)
+        except Exception as e:
+            logger.warning(f"tikwm.com falhou: {e}. Usando yt-dlp como fallback.")
+
     t0 = perf_counter()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_template = str(DOWNLOADS_DIR / f"video_{timestamp}.%(ext)s")
+    platform = detectPlatform(url)
+    
+    # Use meaningful filenames based on platform
+    if download_file:
+        if platform == "youtube":
+            output_template = str(DOWNLOADS_DIR / "%(title)s.%(ext)s")
+        else:
+            output_template = str(DOWNLOADS_DIR / "%(uploader)s_%(id)s.%(ext)s")
+    else:
+        # For URL extraction, timestamp is fine
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_template = str(DOWNLOADS_DIR / f"video_{timestamp}.%(ext)s")
 
     # Comando base
     cmd = [choose_yt_dlp_binary_for_url(url)]
@@ -641,37 +1351,93 @@ def execute_ytdlp(url: str, download_file: bool = True, output_format: str = "mp
     t1 = perf_counter()
     # Adicionar impersonation se necessário
     cmd.extend(get_impersonate_args(url))
+    lower_url = url.lower()
+    is_tiktok = "tiktok.com" in lower_url
+    is_youtube = "youtube.com" in lower_url or "youtu.be" in lower_url
 
     if download_file:
         # Configurar formato de acordo com a preferência
         if output_format == "mp4":
-            # Preferir h264/aac para compatibilidade ampla (Safari/iOS)
-            cmd.extend([
-                '-f',
-                'bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/'
-                'bv*[vcodec^=h264][ext=mp4]+ba[ext=m4a]/'
-                'b[ext=mp4]',
-                '--merge-output-format', 'mp4',
-                '--remux-video', 'mp4'
-            ])
+            if is_tiktok:
+                # Preferir stream progressivo (sem merge) para acelerar
+                cmd.extend([
+                    "-f",
+                    "bv*[ext=mp4][protocol!*=dash][protocol!*=m3u8][acodec!=none]/"
+                    "b[ext=mp4]/best"
+                ])
+            elif is_youtube:
+                # YouTube: MAXIMUM SPEED optimization while keeping max quality
+                # Use pre-merged formats when available (avoids ffmpeg merge time)
+                cmd.extend([
+                    '-f', 
+                    # Priority 1: Pre-merged high quality (no merge needed = faster)
+                    'best[height>=1080][ext=mp4]/'
+                    # Priority 2: Best video + best audio (needs merge but max quality)
+                    'bv*[height>=1080][ext=mp4]+ba[ext=m4a]/'
+                    'bv*[height>=1080]+ba/'
+                    # Priority 3: Any best available
+                    'bv+ba/b',
+                    '--extractor-args', 'youtube:player_client=ios,web',  # Try iOS client first (faster)
+                    '--concurrent-fragments', '16',  # Download 16 fragments simultaneously
+                    '--buffer-size', '32K',  # Larger buffer
+                    '--http-chunk-size', '10M',  # Large chunks
+                    '--retries', '3',  # Quick retry
+                    '--fragment-retries', '3',
+                    '--no-check-certificate',  # Skip cert verification (faster)
+                ])
+                # Use aria2c for multi-threaded downloads (MUCH faster)
+                if shutil.which("aria2c"):
+                    cmd.extend([
+                        '--external-downloader', 'aria2c',
+                        '--external-downloader-args', 
+                        'aria2c:-x 16 -s 16 -k 2M --min-split-size=1M --max-connection-per-server=16 --enable-http-pipelining=true',
+                    ])
+                    logger.info("⚡ YouTube: Using aria2c with 16 parallel connections for MAX SPEED")
+                else:
+                    # Even without aria2c, use concurrent fragments
+                    logger.info("⚡ YouTube: Using concurrent fragments (16) for faster download")
+            else:
+                # Preferir h264/aac para compatibilidade ampla (Safari/iOS)
+                cmd.extend([
+                    '-f',
+                    'bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/'
+                    'bv*[vcodec^=h264][ext=mp4]+ba[ext=m4a]/'
+                    'b[ext=mp4]',
+                    '--merge-output-format', 'mp4',
+                    '--remux-video', 'mp4'
+                ])
         elif output_format == "webm":
             cmd.extend(['-f', 'bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]/best'])
         else:  # best
             cmd.extend(['-f', 'best'])
 
+        if is_tiktok:
+            cmd.extend(["--concurrent-fragments", "8"])
         cmd.extend([
             '-o', output_template,
             '--no-playlist',
+            '--restrict-filenames',  # ASCII-only filenames
+            '--trim-filenames', '200',  # Limit filename length
             '--progress',
-            '--newline'
+            '--newline',
+            '--no-warnings'
         ])
     else:
         # Modo URL direta: retorna melhor URL disponível (pode ser m3u8/MP4)
-        cmd.extend([
-            '--skip-download',
-            '--print', 'thumbnail',
-            '--print', 'url',
-        ])
+        if is_tiktok:
+            cmd.extend([
+                '--skip-download',
+                '--no-warnings',
+                '--print', 'thumbnail',
+                '--print', 'url',
+                '--concurrent-fragments', '8',
+            ])
+        else:
+            cmd.extend([
+                '--skip-download',
+                '--print', 'thumbnail',
+                '--print', 'url',
+            ])
 
     cmd.append(str(url))
 
@@ -689,8 +1455,12 @@ def execute_ytdlp(url: str, download_file: bool = True, output_format: str = "mp
         t3 = perf_counter()
 
         if download_file:
-            # Procurar arquivo baixado
-            downloaded_files = list(DOWNLOADS_DIR.glob(f"video_{timestamp}.*"))
+            # Procurar arquivo baixado (search by most recent since filename is dynamic)
+            downloaded_files = sorted(
+                DOWNLOADS_DIR.glob("*.mp4"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
             if downloaded_files:
                 file_path = downloaded_files[0]
                 t4 = perf_counter()
@@ -748,7 +1518,37 @@ def execute_ytdlp(url: str, download_file: bool = True, output_format: str = "mp
         raise HTTPException(status_code=408, detail="Download timeout (5 minutos)")
     except subprocess.CalledProcessError as e:
         logger.error(f"Erro no yt-dlp: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Erro no yt-dlp: {e.stderr}")
+        error_msg = e.stderr or str(e)
+
+        # Provide more user-friendly error messages
+        if "Unable to extract" in error_msg or "Unable to download" in error_msg or "IP address is blocked" in error_msg or "Video not available" in error_msg:
+            if "instagram" in url.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Instagram bloqueou o download. Verifique se a conta é privada ou tente novamente mais tarde."
+                )
+            elif "youtube" in url.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail="YouTube bloqueou o download. Tente novamente em alguns minutos."
+                )
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Falha ao extrair vídeo. O site pode ter mudado ou bloqueado o acesso."
+                )
+        elif "Private video" in error_msg or "private" in error_msg.lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Vídeo privado. Não é possível baixar vídeos privados."
+            )
+        elif "not available" in error_msg.lower():
+            raise HTTPException(
+                status_code=404,
+                detail="Vídeo não disponível ou foi removido."
+            )
+        else:
+            raise HTTPException(status_code=500, detail=f"Erro no download: {error_msg[:200]}")
     except Exception as e:
         logger.error(f"Erro inesperado: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -764,10 +1564,15 @@ def stream_ytdlp(url: str, output_format: str = "mp4") -> dict:
     cmd = [choose_yt_dlp_binary_for_url(url)]
     cmd.extend(get_cookies_args(url))
     cmd.extend(get_impersonate_args(url))
+    lower_url = url.lower()
+    is_tiktok = "tiktok.com" in lower_url
 
     # Para TikTok, não force formato; deixe yt-dlp escolher progressivo quando possível
-    if "tiktok.com" in url.lower():
-        fmt = "best"
+    if is_tiktok:
+        fmt = (
+            "bv*[ext=mp4][protocol!*=dash][protocol!*=m3u8][acodec!=none]/"
+            "b[ext=mp4]/best"
+        )
     elif output_format == "mp4":
         fmt = (
             "best[ext=mp4][vcodec!=none][acodec!=none][protocol!*=m3u8]/"
@@ -793,6 +1598,9 @@ def stream_ytdlp(url: str, output_format: str = "mp4") -> dict:
         "--no-warnings",
         "--no-progress",
     ])
+
+    if is_tiktok:
+        cmd.extend(["--concurrent-fragments", "8"])
 
     cmd.append(str(url))
     logger.info(f"Streaming yt-dlp: {' '.join(cmd)}")
@@ -926,8 +1734,38 @@ def execute_gallery_dl(url: str) -> dict:
         )
         t3 = perf_counter()
 
-        # Procurar arquivos baixados
-        downloaded_files = [f for f in output_dir.rglob("*") if f.is_file() and not f.name.endswith('.json')]
+        # Procurar arquivos baixados com seus metadados
+        file_with_metadata = []
+        for f in output_dir.rglob("*"):
+            if not f.is_file() or f.name.endswith('.json'):
+                continue
+
+            # Procurar arquivo de metadata correspondente
+            metadata_file = f.with_suffix(f.suffix + '.json')
+            num = None
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r') as mf:
+                        meta = json.load(mf)
+                        # Instagram usa 'num' para indicar a posição no carrossel
+                        num = meta.get('num', meta.get('count', meta.get('position')))
+                except Exception as e:
+                    logger.warning(f"Erro ao ler metadata de {f.name}: {e}")
+
+            file_with_metadata.append((f, num))
+
+        # Ordenar: primeiro por 'num' (se disponível), depois por nome natural
+        def sort_key(item):
+            path, num = item
+            if num is not None:
+                return (0, num, path.name)
+            # Natural sort para arquivos sem metadata
+            parts = re.split(r'(\d+)', path.name)
+            natural_parts = [int(part) if part.isdigit() else part for part in parts]
+            return (1, 0, natural_parts)
+
+        file_with_metadata.sort(key=sort_key)
+        downloaded_files = [path for path, _ in file_with_metadata]
 
         if downloaded_files:
             files_info = [
@@ -981,7 +1819,60 @@ def execute_gallery_dl_urls(url: str) -> list[str]:
             timeout=180,
             check=True
         )
-        urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        urls: list[str] = []
+
+        def _looks_like_media(u: str) -> bool:
+            try:
+                parsed = urlparse(u)
+                host = parsed.netloc.lower()
+                path = parsed.path.lower()
+            except Exception:
+                return True
+
+            ext = Path(path).suffix.lstrip(".").lower()
+            blocked_ext = {"json", "txt", "html", "xml"}
+            allowed_ext = {
+                "mp4", "webm", "mov", "m4v", "mp3", "m4a", "aac",
+                "jpg", "jpeg", "png", "gif", "webp", "m3u8", "mpd"
+            }
+
+            if ext in blocked_ext:
+                return False
+            if ext in allowed_ext:
+                return True
+
+            # Instagram: ignore URLs que não são CDN de mídia
+            if "instagram.com" in host and not any(cdn in host for cdn in ["cdninstagram.com", "fbcdn.net", "fna.fbcdn.net"]):
+                return False
+
+            # TikTok: se não tem extensão e não parece arquivo, provavelmente é página HTML
+            if "tiktok.com" in host and not ext:
+                return False
+
+            return True
+
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            # Skip ytdl: prefixed lines (not direct URLs)
+            if line.startswith("ytdl:"):
+                continue
+
+            # gallery-dl às vezes retorna linhas com prefixo "| " ou texto extra;
+            # extrai a primeira URL http(s) válida para evitar gerar paths inválidos no frontend
+            if line.startswith("|"):
+                line = line.lstrip("|").strip()
+
+            match = re.search(r"https?://\S+", line)
+            if not match:
+                continue
+
+            candidate = match.group(0).rstrip("|,\"'")
+            if candidate.startswith(("http://", "https://")) and candidate not in urls and _looks_like_media(candidate):
+                urls.append(candidate)
+
         if not urls:
             raise HTTPException(status_code=404, detail="Nenhuma URL retornada pelo gallery-dl")
         return urls
@@ -1040,6 +1931,163 @@ async def health_check():
     }
 
 
+@app.get("/youtube/formats")
+async def get_youtube_formats(
+    url: str = Query(..., description="YouTube video URL"),
+    api_key: str = Security(validate_api_key)
+):
+    """
+    Get all available formats for a YouTube video without downloading.
+    Returns video and audio quality options with file sizes.
+    """
+    import json
+    logger.info(f"📋 Fetching formats for: {url}")
+    
+    # #region agent log
+    try:
+        with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"location":"main.py:1824","message":"get_youtube_formats entry","data":{"url":url[:100]},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run1","hypothesisId":"D,E"})+"\n")
+    except: pass
+    # #endregion
+    
+    try:
+        cmd = [choose_yt_dlp_binary_for_url(url)]
+        cmd.extend(get_cookies_args(url))
+        cmd.extend([
+            '-F',  # List all formats
+            '--no-warnings',
+            '--no-playlist',  # Don't process playlists, only the single video
+            '--playlist-end', '1',  # Safety: only process first item if playlist detected
+            url
+        ])
+        
+        # #region agent log
+        try:
+            with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"location":"main.py:1844","message":"Before subprocess.run","data":{"cmd":' '.join(cmd[:6])+"..."},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run2","hypothesisId":"E"})+"\n")
+        except: pass
+        # #endregion
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,  # Reduced to 30 seconds since we're not processing playlists
+            check=True
+        )
+        
+        # #region agent log
+        try:
+            with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"location":"main.py:1852","message":"After subprocess.run","data":{"returncode":result.returncode,"stdoutLength":len(result.stdout),"stderrLength":len(result.stderr)},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run1","hypothesisId":"E"})+"\n")
+        except: pass
+        # #endregion
+        
+        # Parse yt-dlp format output
+        formats = []
+        lines = result.stdout.split('\n')
+        
+        for line in lines:
+            # Skip header and empty lines
+            if not line.strip() or 'format code' in line.lower() or line.startswith('-'):
+                continue
+                
+            # Parse format line
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+                
+            format_id = parts[0]
+            ext = parts[1]
+            
+            # Extract resolution and filesize
+            resolution = 'audio only' if 'audio only' in line else ''
+            filesize = ''
+            note = ''
+            
+            for i, part in enumerate(parts):
+                if 'x' in part and part.replace('x', '').isdigit():
+                    resolution = part
+                elif 'MiB' in part or 'KiB' in part or 'GiB' in part:
+                    # Clean up the filesize
+                    if i > 0:
+                        size_num = parts[i-1].lstrip('|~≈')
+                        if size_num.replace('.', '').isdigit():
+                            filesize = f"~{size_num} {part}"
+                        else:
+                            filesize = f"~{part}"
+                    else:
+                        filesize = f"~{part}"
+                elif part.endswith('p') and part[:-1].isdigit():
+                    resolution = part
+            
+            # Quality labels
+            if 'audio only' in line:
+                note = 'Áudio'
+            elif '2160' in line or '4k' in line.lower():
+                note = '4K Ultra HD'
+            elif '1440' in line:
+                note = '2K Quad HD'
+            elif '1080' in line:
+                note = 'Full HD 1080p'
+            elif '720' in line:
+                note = 'HD 720p'
+            elif '480' in line:
+                note = 'SD 480p'
+            elif '360' in line:
+                note = 'SD 360p'
+            
+            if note:  # Only include formats we can label
+                formats.append({
+                    'format_id': format_id,
+                    'ext': ext,
+                    'resolution': resolution,
+                    'filesize': filesize,
+                    'note': note
+                })
+        
+        logger.info(f"✅ Found {len(formats)} formats")
+        
+        # #region agent log
+        try:
+            with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"location":"main.py:1915","message":"Before return response","data":{"formatsCount":len(formats)},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run1","hypothesisId":"G"})+"\n")
+        except: pass
+        # #endregion
+        
+        return {
+            'success': True,
+            'formats': formats
+        }
+        
+    except subprocess.TimeoutExpired as e:
+        # #region agent log
+        try:
+            with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"location":"main.py:1922","message":"TimeoutExpired","data":{"error":str(e)},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run1","hypothesisId":"E"})+"\n")
+        except: pass
+        # #endregion
+        raise HTTPException(status_code=408, detail="Timeout ao buscar formatos")
+    except subprocess.CalledProcessError as e:
+        # #region agent log
+        try:
+            with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"location":"main.py:1927","message":"CalledProcessError","data":{"returncode":e.returncode,"stderr":e.stderr[:200] if e.stderr else None},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run1","hypothesisId":"E"})+"\n")
+        except: pass
+        # #endregion
+        logger.error(f"Erro ao buscar formatos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar formatos: {str(e)}")
+    except Exception as e:
+        # #region agent log
+        try:
+            with open('/Users/miguelcrasto/Downloads/social-media-transcription/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"location":"main.py:1932","message":"General Exception","data":{"errorType":type(e).__name__,"errorMessage":str(e)[:200]},"timestamp":int(__import__('time').time()*1000),"sessionId":"debug-session","runId":"run1","hypothesisId":"A,E"})+"\n")
+        except: pass
+        # #endregion
+        logger.error(f"Erro ao buscar formatos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar formatos: {str(e)}")
+
+
 @app.post("/download", response_model=DownloadResponse)
 async def download_json(
     request: DownloadRequest,
@@ -1082,71 +2130,182 @@ async def download_json(
 @app.post("/download/binary")
 async def download_binary(
     url: str = Query(..., description="URL do vídeo/imagem"),
-    tool: Literal["yt-dlp", "gallery-dl"] = Query(..., description="Ferramenta a usar"),
-    format: Literal["mp4", "webm", "best"] = Query(default="mp4", description="Formato do vídeo (apenas yt-dlp)"),
+    format: Literal["mp4", "webm", "best"] = Query(default="mp4", description="Formato do vídeo"),
+    quality: str = Query(default="max", description="Qualidade do vídeo (max, 1080, 720, 480)"),
     api_key: str = Security(validate_api_key)
 ):
     """
-    Faz download e retorna o arquivo binário diretamente.
-    Ideal para: n8n processar o arquivo diretamente como binary.
+    Universal download endpoint for all platforms:
+    - Instagram: Returns JSON with direct URL
+    - TikTok: Returns JSON with direct URL  
+    - YouTube: Downloads and returns file
+    - Twitter/X: Downloads and returns file
     """
-    logger.info(f"Download Binary request: {url} usando {tool}")
-
+    logger.info(f"🚀 Binary download request: {url} formato={format} qualidade={quality}")
+    
+    t_start = perf_counter()
+    platform = detectPlatform(url)
+    
     try:
-        if tool == "yt-dlp":
-            result = execute_ytdlp(url, download_file=True, output_format=format)
+        # Instagram: Use gallery-dl URLs for fast redirect (reels, carousels, posts, stories)
+        if platform == "instagram":
+            logger.info("📸 Instagram detected - using gallery-dl for direct URL")
+            try:
+                # Extract direct URLs only (fast, no download)
+                urls = execute_gallery_dl_urls(url)
+                
+                if not urls:
+                    raise HTTPException(status_code=404, detail="No media URLs found")
+                
+                # Get first URL (for reels/posts with single video)
+                direct_url = urls[0]
+                
+                # Extract username from original URL
+                username = extract_username_from_instagram_url(url)
+                
+                t_end = perf_counter()
+                total_ms = int((t_end - t_start) * 1000)
+                logger.info(f"✅ Instagram direct URL extracted in {total_ms}ms")
+                logger.info(f"👤 Username: {username}")
+                logger.info(f"🔗 Direct URL: {direct_url[:100]}...")
+                
+                # Return JSON with direct URL for frontend redirect
+                return Response(
+                    content=json.dumps({
+                        "direct_url": direct_url,
+                        "platform": platform,
+                        "username": username
+                    }),
+                    media_type="application/json",
+                    headers={
+                        "X-Direct-Download": "true",
+                        "X-Platform": platform,
+                        "X-Processing-Time-Ms": str(total_ms)
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"gallery-dl failed for Instagram: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Não foi possível baixar este conteúdo do Instagram. Verifique se a conta não é privada ou tente novamente."
+                )
+        
+        # TikTok: Return direct URL via tikwm API (JSON response to avoid CORS issues)
+        elif platform == "tiktok":
+            logger.info("🎵 TikTok detected - using tikwm API for direct URL")
+            
+            # Use tikwm to get video metadata
+            api_url = f"https://www.tikwm.com/api/?url={url}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Connection": "keep-alive",
+            }
+            resp = requests.get(api_url, headers=headers, timeout=8, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if data.get("code") != 0:
+                raise HTTPException(status_code=500, detail=f"tikwm API error: {data.get('msg', 'Unknown error')}")
+            
+            video_data = data.get("data", {})
+            
+            # Try HD video first, then fallback to standard quality
+            direct_url = video_data.get("hdplay") or video_data.get("play") or video_data.get("wmplay")
+            
+            if not direct_url:
+                raise HTTPException(status_code=404, detail="No video URL found from tikwm")
+            
+            # Extract username and video ID for filename (format: tiktok_username_videoid.mp4)
+            author = video_data.get("author", {}).get("unique_id", "user")
+            video_id = video_data.get("id", "video")
+            filename = f"tiktok_{author}_{video_id}.mp4"
+            
+            t_end = perf_counter()
+            total_ms = int((t_end - t_start) * 1000)
+            logger.info(f"✅ TikTok direct URL: {direct_url[:100]}...")
+            logger.info(f"📁 Filename: {filename}")
+            
+            return Response(
+                content=json.dumps({
+                    "direct_url": direct_url,
+                    "platform": platform,
+                    "filename": filename
+                }),
+                media_type="application/json",
+                headers={
+                    "X-Direct-Download": "true",
+                    "X-Platform": platform,
+                    "X-Processing-Time-Ms": str(total_ms)
+                }
+            )
+        
+        # YouTube: Download with yt-dlp (best quality) and send complete file
+        elif platform == "youtube":
+            logger.info("▶️  YouTube detected - downloading with best quality")
+            result = execute_ytdlp_optimized(url, output_format="mp4")
             file_path = Path(result["file_path"])
-            # Detect MIME pelo arquivo gerado
-            mime_type = "application/octet-stream"
-            ext = file_path.suffix.lower()
-            if ext == ".mp4":
-                mime_type = "video/mp4"
-            elif ext == ".webm":
-                mime_type = "video/webm"
-
-            return FileResponse(
-                path=file_path,
-                media_type=mime_type,
-                filename=file_path.name,
+            
+            # Read entire file
+            with open(file_path, "rb") as f:
+                content = f.read()
+            
+            filename = file_path.name
+            file_path.unlink(missing_ok=True)
+            
+            t_end = perf_counter()
+            total_ms = int((t_end - t_start) * 1000)
+            logger.info(f"✅ YouTube download completed in {total_ms}ms, size: {len(content)} bytes")
+            
+            return Response(
+                content=content,
+                media_type="video/mp4",
                 headers={
-                    "X-File-Size": result["file_size"],
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-Tool-Used": "yt-dlp-best-quality",
+                    "X-Processing-Time-Ms": str(total_ms),
+                    "X-File-Size": str(len(content))
+                }
+            )
+        
+        # Twitter/X: Download with yt-dlp and send file
+        elif platform == "twitter":
+            logger.info("🐦 Twitter/X detected - downloading with yt-dlp")
+            result = execute_ytdlp_optimized(url, output_format="mp4")
+            file_path = Path(result["file_path"])
+            
+            # Read entire file
+            with open(file_path, "rb") as f:
+                content = f.read()
+            
+            filename = file_path.name
+            file_path.unlink(missing_ok=True)
+            
+            t_end = perf_counter()
+            total_ms = int((t_end - t_start) * 1000)
+            logger.info(f"✅ Twitter download completed in {total_ms}ms, size: {len(content)} bytes")
+            
+            return Response(
+                content=content,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
                     "X-Tool-Used": "yt-dlp",
-                    "X-Format": result.get("format", format)
+                    "X-Processing-Time-Ms": str(total_ms),
+                    "X-File-Size": str(len(content))
                 }
             )
+        
         else:
-            result = execute_gallery_dl(url)
-            if not result["files"]:
-                raise HTTPException(status_code=404, detail="Nenhum arquivo baixado")
-
-            first_file = Path(result["files"][0]["path"])
-
-            # Detectar tipo MIME
-            mime_type = "application/octet-stream"
-            if first_file.suffix.lower() in ['.jpg', '.jpeg']:
-                mime_type = "image/jpeg"
-            elif first_file.suffix.lower() == '.png':
-                mime_type = "image/png"
-            elif first_file.suffix.lower() == '.gif':
-                mime_type = "image/gif"
-            elif first_file.suffix.lower() == '.webp':
-                mime_type = "image/webp"
-
-            return FileResponse(
-                path=first_file,
-                media_type=mime_type,
-                filename=first_file.name,
-                headers={
-                    "X-File-Size": result["files"][0]["size"],
-                    "X-Tool-Used": "gallery-dl",
-                    "X-Total-Files": str(len(result["files"]))
-                }
-            )
+            raise HTTPException(status_code=400, detail=f"Unsupported platform: {platform}")
+        
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro no download binary: {str(e)}")
+        logger.error(f"Erro no binary stream: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 @app.options("/download/binary")
@@ -1207,6 +2366,11 @@ async def download_gallery_zip(
     download_dir = Path(result["download_dir"])
     zip_path = zip_directory(download_dir)
 
+    # Cleanup both zip and download directory after response
+    async def cleanup_both():
+        cleanup_path(zip_path)
+        cleanup_path(download_dir)
+
     return FileResponse(
         path=zip_path,
         media_type="application/zip",
@@ -1215,7 +2379,8 @@ async def download_gallery_zip(
             "X-File-Size": get_file_size(zip_path),
             "X-Tool-Used": "gallery-dl",
             "X-Total-Files": str(len(result.get("files", [])))
-        }
+        },
+        background=BackgroundTask(cleanup_both)
     )
 
 
@@ -1260,7 +2425,8 @@ async def convert_hls_to_mp4(
                 "X-File-Size": result["file_size"],
                 "X-Tool-Used": "yt-dlp",
                 "X-Format": result.get("format", "mp4")
-            }
+            },
+            background=BackgroundTask(cleanup_path, file_path)
         )
     except HTTPException:
         raise
@@ -1348,12 +2514,23 @@ async def transcribe_video(
     api_key: str = Security(validate_api_key)
 ):
     """
-    Baixa o áudio do vídeo e envia para o Whisper.
+    Baixa o áudio do vídeo via Cobalt e envia para o Whisper.
     Retorna o texto transcrito.
     """
-    audio_path = download_audio_from_url(str(request.url), request.format or "mp3")
+    audio_path = None
     try:
+        # Download audio using Cobalt
+        logger.info(f"Downloading audio via Cobalt for transcription: {request.url}")
+        result = download_via_cobalt(str(request.url), audio_only=True, quality="max")
+        
+        # Save to temporary file for Whisper
+        audio_path = DOWNLOADS_DIR / result["filename"]
+        with open(audio_path, "wb") as f:
+            f.write(result["blob"])
+        
+        # Transcribe with Whisper
         transcript = transcribe_audio_file(audio_path, language=request.language)
+        
         return {
             "success": True,
             "message": "Transcrição concluída",
@@ -1362,7 +2539,8 @@ async def transcribe_video(
             "file_size": get_file_size(audio_path)
         }
     finally:
-        audio_path.unlink(missing_ok=True)
+        if audio_path and audio_path.exists():
+            audio_path.unlink(missing_ok=True)
 
 
 @app.post("/transcribe/image")
@@ -1398,13 +2576,31 @@ async def transcribe_instagram(
     """
     Extrai texto das imagens de um post/carrossel do Instagram.
     Usa gallery-dl para baixar imagens e vision da OpenAI para transcrição.
+    MACROBENCHMARK: Tempo total do endpoint incluindo download + transcrição paralela.
     """
-    items = transcribe_instagram_carousel(str(request.url), request.prompt, request.max_items or 5)
-    return {
-        "success": True,
-        "message": f"{len(items)} imagem(ns) processada(s)",
-        "items": items
-    }
+    t_start = perf_counter()
+    items = transcribe_instagram_carousel(str(request.url), request.prompt or DEFAULT_TRANSCRIBE_PROMPT)
+    t_end = perf_counter()
+
+    total_ms = int((t_end - t_start) * 1000)
+    logger.info(f"🏁 MACROBENCHMARK /transcribe/instagram: {total_ms}ms total")
+
+    return Response(
+        content=json.dumps({
+            "success": True,
+            "message": f"{len(items)} imagem(ns) processada(s)",
+            "items": items,
+            "performance": {
+                "total_ms": total_ms,
+                "avg_per_item_ms": total_ms // len(items) if items else 0
+            }
+        }),
+        media_type="application/json",
+        headers={
+            "X-Processing-Time-Ms": str(total_ms),
+            "X-Items-Processed": str(len(items))
+        }
+    )
 
 
 if __name__ == "__main__":
