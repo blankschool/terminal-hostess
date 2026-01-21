@@ -681,7 +681,7 @@ def download_via_cobalt(url: str, audio_only: bool = False, quality: str = "max"
 def detectPlatform(url: str) -> str:
     """Helper function to detect platform from URL"""
     lower_url = url.lower()
-    if "youtube.com" in lower_url or "youtu.be" in lower_url:
+    if "youtube.com" in lower_url or "youtu.be" in lower_url or "music.youtube.com" in lower_url:
         return "youtube"
     if "tiktok.com" in lower_url:
         return "tiktok"
@@ -689,7 +689,31 @@ def detectPlatform(url: str) -> str:
         return "instagram"
     if "twitter.com" in lower_url or "x.com" in lower_url:
         return "twitter"
-    return "video"
+    if "reddit.com" in lower_url or "redd.it" in lower_url:
+        return "reddit"
+    if "pinterest.com" in lower_url or "pin.it" in lower_url:
+        return "pinterest"
+    if "twitch.tv" in lower_url:
+        return "twitch"
+    if "vimeo.com" in lower_url:
+        return "vimeo"
+    if "soundcloud.com" in lower_url:
+        return "soundcloud"
+    if "bilibili.com" in lower_url or "bilibili.tv" in lower_url:
+        return "bilibili"
+    if "tumblr.com" in lower_url:
+        return "tumblr"
+    if "dailymotion.com" in lower_url:
+        return "dailymotion"
+    if "streamable.com" in lower_url:
+        return "streamable"
+    if "facebook.com" in lower_url or "fb.watch" in lower_url:
+        return "facebook"
+    if "snapchat.com" in lower_url:
+        return "snapchat"
+    if "loom.com" in lower_url:
+        return "loom"
+    return "other"
 
 
 def download_via_ytdlp_fallback(url: str, audio_only: bool = False) -> dict:
@@ -2180,10 +2204,9 @@ async def download_binary(
 ):
     """
     Universal download endpoint for all platforms:
-    - Instagram: Returns JSON with direct URL
-    - TikTok: Returns JSON with direct URL  
-    - YouTube: Downloads and returns file
-    - Twitter/X: Downloads and returns file
+    - TikTok: Returns JSON with direct URL (tikwm.com API - fastest)
+    - Instagram, YouTube, Twitter, Reddit, Pinterest, etc.: Uses Cobalt API (primary)
+    - Fallback to yt-dlp if Cobalt fails
     """
     logger.info(f"🚀 Binary download request: {url} formato={format} qualidade={quality}")
     
@@ -2191,52 +2214,9 @@ async def download_binary(
     platform = detectPlatform(url)
     
     try:
-        # Instagram: Use gallery-dl URLs for fast redirect (reels, carousels, posts, stories)
-        if platform == "instagram":
-            logger.info("📸 Instagram detected - using gallery-dl for direct URL")
-            try:
-                # Extract direct URLs only (fast, no download)
-                urls = execute_gallery_dl_urls(url)
-                
-                if not urls:
-                    raise HTTPException(status_code=404, detail="No media URLs found")
-                
-                # Get first URL (for reels/posts with single video)
-                direct_url = urls[0]
-                
-                # Extract username from original URL
-                username = extract_username_from_instagram_url(url)
-                
-                t_end = perf_counter()
-                total_ms = int((t_end - t_start) * 1000)
-                logger.info(f"✅ Instagram direct URL extracted in {total_ms}ms")
-                logger.info(f"👤 Username: {username}")
-                logger.info(f"🔗 Direct URL: {direct_url[:100]}...")
-                
-                # Return JSON with direct URL for frontend redirect
-                return Response(
-                    content=json.dumps({
-                        "direct_url": direct_url,
-                        "platform": platform,
-                        "username": username
-                    }),
-                    media_type="application/json",
-                    headers={
-                        "X-Direct-Download": "true",
-                        "X-Platform": platform,
-                        "X-Processing-Time-Ms": str(total_ms)
-                    }
-                )
-                
-            except Exception as e:
-                logger.error(f"gallery-dl failed for Instagram: {e}")
-                raise HTTPException(
-                    status_code=503,
-                    detail="Não foi possível baixar este conteúdo do Instagram. Verifique se a conta não é privada ou tente novamente."
-                )
-        
         # TikTok: Return direct URL via tikwm API (JSON response to avoid CORS issues)
-        elif platform == "tiktok":
+        # Keep tikwm.com as it's fast and reliable for TikTok
+        if platform == "tiktok":
             logger.info("🎵 TikTok detected - using tikwm API for direct URL")
             
             # Use tikwm to get video metadata
@@ -2250,7 +2230,9 @@ async def download_binary(
             data = resp.json()
             
             if data.get("code") != 0:
-                raise HTTPException(status_code=500, detail=f"tikwm API error: {data.get('msg', 'Unknown error')}")
+                # tikwm failed, try Cobalt as fallback
+                logger.warning(f"tikwm failed: {data.get('msg', 'Unknown error')}, trying Cobalt...")
+                return await _download_via_cobalt_with_fallback(url, platform, t_start, quality)
             
             video_data = data.get("data", {})
             
@@ -2258,7 +2240,9 @@ async def download_binary(
             direct_url = video_data.get("hdplay") or video_data.get("play") or video_data.get("wmplay")
             
             if not direct_url:
-                raise HTTPException(status_code=404, detail="No video URL found from tikwm")
+                # No URL from tikwm, try Cobalt
+                logger.warning("No video URL from tikwm, trying Cobalt...")
+                return await _download_via_cobalt_with_fallback(url, platform, t_start, quality)
             
             # Extract username and video ID for filename (format: tiktok_username_videoid.mp4)
             author = video_data.get("author", {}).get("unique_id", "user")
@@ -2284,41 +2268,114 @@ async def download_binary(
                 }
             )
         
-        # YouTube: Download with yt-dlp (best quality) and send complete file
-        elif platform == "youtube":
-            logger.info("▶️  YouTube detected - downloading with best quality")
-            result = execute_ytdlp_optimized(url, output_format="mp4")
-            file_path = Path(result["file_path"])
-            
-            # Read entire file
-            with open(file_path, "rb") as f:
-                content = f.read()
-            
-            filename = file_path.name
-            file_path.unlink(missing_ok=True)
-            
-            t_end = perf_counter()
-            total_ms = int((t_end - t_start) * 1000)
-            logger.info(f"✅ YouTube download completed in {total_ms}ms, size: {len(content)} bytes")
-            
-            return Response(
-                content=content,
-                media_type="video/mp4",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "X-Tool-Used": "yt-dlp-best-quality",
-                    "X-Processing-Time-Ms": str(total_ms),
-                    "X-File-Size": str(len(content))
-                }
-            )
+        # All other platforms: Use Cobalt API as primary with yt-dlp fallback
+        # Supported: Instagram, YouTube, Twitter, Reddit, Pinterest, Twitch, Vimeo, SoundCloud, etc.
+        else:
+            if cobalt_config.COBALT_PRIMARY:
+                logger.info(f"🌐 {platform.title()} detected - using Cobalt API as primary")
+                return await _download_via_cobalt_with_fallback(url, platform, t_start, quality)
+            else:
+                # Fallback to legacy methods when COBALT_PRIMARY is disabled
+                return await _download_via_legacy_methods(url, platform, t_start, format)
         
-        # Twitter/X: Download with yt-dlp and send file
-        elif platform == "twitter":
-            logger.info("🐦 Twitter/X detected - downloading with yt-dlp")
-            result = execute_ytdlp_optimized(url, output_format="mp4")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro no binary stream: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _download_via_cobalt_with_fallback(url: str, platform: str, t_start: float, quality: str = "max") -> Response:
+    """
+    Download via Cobalt API with fallback to yt-dlp/gallery-dl if Cobalt fails.
+    Returns a Response with the downloaded content or JSON with direct_url.
+    """
+    try:
+        logger.info(f"📥 Attempting Cobalt download for {platform}: {url}")
+        result = download_via_cobalt(url, audio_only=False, quality=quality)
+        
+        content = result["blob"]
+        filename = result["filename"]
+        content_type = result.get("content_type", "video/mp4")
+        
+        t_end = perf_counter()
+        total_ms = int((t_end - t_start) * 1000)
+        size_mb = len(content) / (1024 * 1024)
+        
+        logger.info(f"✅ Cobalt download successful for {platform}: {size_mb:.2f}MB in {total_ms}ms")
+        
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Tool-Used": "cobalt-api",
+                "X-Platform": platform,
+                "X-Processing-Time-Ms": str(total_ms),
+                "X-File-Size": str(len(content))
+            }
+        )
+        
+    except Exception as cobalt_error:
+        logger.warning(f"⚠️ Cobalt failed for {platform}: {cobalt_error}")
+        
+        # Fallback to legacy methods
+        if cobalt_config.ENABLE_YTDLP_FALLBACK:
+            logger.info(f"🔄 Falling back to legacy method for {platform}...")
+            return await _download_via_legacy_methods(url, platform, t_start, "mp4")
+        
+        # No fallback, return error
+        raise HTTPException(
+            status_code=503,
+            detail=f"Erro ao baixar via Cobalt: {str(cobalt_error)}. Tente novamente mais tarde."
+        )
+
+
+async def _download_via_legacy_methods(url: str, platform: str, t_start: float, format: str = "mp4") -> Response:
+    """
+    Download using legacy methods (yt-dlp, gallery-dl) when Cobalt is disabled or fails.
+    """
+    try:
+        if platform == "instagram":
+            logger.info("📸 Instagram - using gallery-dl for direct URL")
+            try:
+                urls = execute_gallery_dl_urls(url)
+                
+                if not urls:
+                    raise HTTPException(status_code=404, detail="No media URLs found")
+                
+                direct_url = urls[0]
+                username = extract_username_from_instagram_url(url)
+                
+                t_end = perf_counter()
+                total_ms = int((t_end - t_start) * 1000)
+                logger.info(f"✅ Instagram direct URL extracted in {total_ms}ms")
+                
+                return Response(
+                    content=json.dumps({
+                        "direct_url": direct_url,
+                        "platform": platform,
+                        "username": username
+                    }),
+                    media_type="application/json",
+                    headers={
+                        "X-Direct-Download": "true",
+                        "X-Platform": platform,
+                        "X-Processing-Time-Ms": str(total_ms)
+                    }
+                )
+            except Exception as e:
+                logger.error(f"gallery-dl failed for Instagram: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Erro no gallery-dl: {str(e)}"
+                )
+        
+        elif platform in ("youtube", "twitter", "reddit", "twitch", "vimeo", "dailymotion", "facebook", "other"):
+            logger.info(f"📹 {platform.title()} - using yt-dlp")
+            result = execute_ytdlp_optimized(url, output_format=format)
             file_path = Path(result["file_path"])
             
-            # Read entire file
             with open(file_path, "rb") as f:
                 content = f.read()
             
@@ -2327,7 +2384,7 @@ async def download_binary(
             
             t_end = perf_counter()
             total_ms = int((t_end - t_start) * 1000)
-            logger.info(f"✅ Twitter download completed in {total_ms}ms, size: {len(content)} bytes")
+            logger.info(f"✅ {platform.title()} download completed in {total_ms}ms, size: {len(content)} bytes")
             
             return Response(
                 content=content,
@@ -2335,19 +2392,44 @@ async def download_binary(
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
                     "X-Tool-Used": "yt-dlp",
+                    "X-Platform": platform,
                     "X-Processing-Time-Ms": str(total_ms),
                     "X-File-Size": str(len(content))
                 }
             )
         
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported platform: {platform}")
-        
+            # Try yt-dlp for any unknown platform
+            logger.info(f"📹 Unknown platform ({platform}) - trying yt-dlp")
+            result = execute_ytdlp_optimized(url, output_format=format)
+            file_path = Path(result["file_path"])
+            
+            with open(file_path, "rb") as f:
+                content = f.read()
+            
+            filename = file_path.name
+            file_path.unlink(missing_ok=True)
+            
+            t_end = perf_counter()
+            total_ms = int((t_end - t_start) * 1000)
+            
+            return Response(
+                content=content,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-Tool-Used": "yt-dlp",
+                    "X-Platform": platform,
+                    "X-Processing-Time-Ms": str(total_ms),
+                    "X-File-Size": str(len(content))
+                }
+            )
+            
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro no binary stream: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Legacy download failed for {platform}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro no download: {str(e)}")
 
 
 

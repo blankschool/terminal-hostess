@@ -120,14 +120,14 @@ export default function App() {
       });
 
       if (!response.ok) {
-        // Try to parse JSON error from backend
+        // Read body once as text, then try to parse as JSON
+        const errorText = await response.text();
         try {
-          const errorJson = await response.json();
+          const errorJson = JSON.parse(errorText);
           const errorDetail = errorJson.detail || JSON.stringify(errorJson);
           throw new Error(errorDetail);
         } catch (parseErr) {
-          // If not JSON, use text
-          const errorText = await response.text();
+          // If not valid JSON, use the raw text
           throw new Error(errorText || 'Erro ao baixar vídeo');
         }
       }
