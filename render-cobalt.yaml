@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: cobalt-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile.cobalt
+    region: oregon
+    plan: free
+    envVars:
+      - key: API_URL
+        value: https://cobalt-api.onrender.com
+      - key: CORS_URL
+        value: "*"
+      - key: CORS_WILDCARD
+        value: "true"
+    healthCheckPath: /

@@ -1,0 +1,23 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install dependencies for Cobalt
+RUN apk add --no-cache git ffmpeg
+
+# Clone Cobalt repository
+RUN git clone https://github.com/imputnet/cobalt.git .
+
+# Install dependencies
+WORKDIR /app/api
+RUN npm ci
+
+# Expose port
+EXPOSE 10000
+
+# Set environment variables
+ENV API_PORT=10000
+ENV API_LISTEN_ADDRESS=0.0.0.0
+
+# Start the API
+CMD ["npm", "start"]
