@@ -29,8 +29,9 @@ COBALT_TIMEOUT = int(os.getenv("COBALT_TIMEOUT", "60"))
 ENABLE_YTDLP_FALLBACK = os.getenv("ENABLE_YTDLP_FALLBACK", "true").lower() == "true"
 
 # Use Cobalt as primary download method (instead of yt-dlp/gallery-dl)
-# Default to TRUE for better reliability on Instagram/YouTube/Twitter
-COBALT_PRIMARY = os.getenv("COBALT_PRIMARY", "true").lower() == "true"
+# Default to FALSE because public Cobalt API now requires JWT authentication
+# Set to TRUE only if you have a self-hosted Cobalt instance configured
+COBALT_PRIMARY = os.getenv("COBALT_PRIMARY", "false").lower() == "true"
 
 # Platforms supported by Cobalt API
 # Reference: https://github.com/imputnet/cobalt
