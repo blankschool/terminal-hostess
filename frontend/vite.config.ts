@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     // Serve assets under /ui in production because FastAPI mounts the UI there
-    base: isDev ? '/' : '/ui/',
+    base: '/ui/',
     server: {
       host: '::',
       port: 8080,
