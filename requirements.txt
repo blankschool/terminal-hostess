@@ -16,4 +16,4 @@ openai>=1.52.2
 gallery-dl>=1.26.0
 
 # Optional: yt-dlp kept as fallback (only if ENABLE_YTDLP_FALLBACK=true)
-# yt-dlp>=2023.11.0
+yt-dlp>=2023.11.0

@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.git/
+.gitignore
+*.md
+.DS_Store
+node_modules/
+frontend/node_modules/
+*.log
+logs/
+downloads/
+bin/
+cobalt-main/
+frontend backup/
+.cursor/
